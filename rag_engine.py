@@ -12,7 +12,6 @@ import json
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import OpenAI
-
 from langchain_core.prompts import PromptTemplate
 from ApplicationConstants import AppConstants
 from Schemas import AskRequest, AskVehicleRequest

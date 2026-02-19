@@ -13,7 +13,10 @@ RAG = RAGEngine()
 
 @router.get("/")
 def root():
+    print("RAG FastAPI is running!")
     return {"message": "RAG FastAPI is running!"} 
+    
+
 
 
 @router.post("/ask_RAG")
