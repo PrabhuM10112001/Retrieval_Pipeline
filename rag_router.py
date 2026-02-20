@@ -6,16 +6,15 @@ from JwtValidation.JwtTokenValidate import jwt_filter
 router = APIRouter(
     prefix="/rag",
     tags=["RAG APIs"],
-    # dependencies=[Depends(jwt_filter)]  # Wrap Depends in a list
+    dependencies=[Depends(jwt_filter)]  
 )
 
 RAG = RAGEngine()
 
 @router.get("/")
 def root():
-    print("RAG FastAPI is running!")
     return {"message": "RAG FastAPI is running!"} 
-    
+     
 
 
 
@@ -33,7 +32,10 @@ def add_json(req: AskVehicleRequest):
 
 
 @router.post("/vehiclesummary")
-def vehicle_summary_by_name(req: VehicleSummaryByNameRequest):
+def vehicle_summary_by_name(
+    req: VehicleSummaryByNameRequest,
+    claims: dict = Depends(jwt_filter),
+):
     result = RAG.get_vehicle_summary_by_name(
         query=req.query,
         vehicleid_collection=req.vehicleid_collection,
@@ -42,5 +44,6 @@ def vehicle_summary_by_name(req: VehicleSummaryByNameRequest):
         vehicle_id_key=req.vehicle_id_key,
         k=req.k,
         session_id=req.session_id,
+        claims=claims,
     )
     return result

@@ -10,7 +10,7 @@ from ApplicationConstants import AppConstants
 ALGORITHM = "HS256"
 
 app = FastAPI()
-security = HTTPBearer()
+security = HTTPBearer(bearerFormat="JWT")
 
 
 app.add_middleware(
@@ -77,50 +77,13 @@ def get_all_claim_details_from_token(token: str) -> dict:
 
 def jwt_filter(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security)  
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ) -> dict:
-    try:
-        jwt_token = credentials.credentials  
-
-        old_token = rebuild_token_like_spring(jwt_token)
-        if not old_token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token format"
-            )
-
-        if validate_token(old_token):
-            claims = get_all_claim_details_from_token(old_token)
-
-            request.state.user_id = claims.get("userId")
-            request.state.user_name = claims.get("userName")
-
-            request.session["claims"] = claims
-
-            return claims
-
-    except ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    
-
-    
-def jwt_filter(request: Request) -> dict:
     """
     Replicates Spring filter logic for JWT validation and claims extraction.
     """
     try:
-        # Extract JWT from request
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing or invalid Authorization header"
-            )
-        
-        jwt_token = auth_header.split(" ")[1]
+        jwt_token = credentials.credentials
         
         if jwt_token:
             # Rebuild token like Spring
@@ -148,15 +111,12 @@ def jwt_filter(request: Request) -> dict:
                 request.state.user_name = claims.get("userName")
                 request.state.vehicle_label = claims.get("vehicleLabel")
                 
-                # Store claims in session
-                request.session["claims"] = claims
+                # # Store claims in session
+                # request.session["claims"] = claims
                 
                 return claims
         
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token not found"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token not found")
 
     except ExpiredSignatureError:
         raise HTTPException(

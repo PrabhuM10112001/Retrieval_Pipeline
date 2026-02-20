@@ -12,6 +12,10 @@ import json
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import OpenAI
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:
+    ChatGoogleGenerativeAI = None
 from langchain_core.prompts import PromptTemplate
 from ApplicationConstants import AppConstants
 from Schemas import AskRequest, AskVehicleRequest
@@ -26,7 +30,8 @@ class RAGEngine:
         collection_name: str = "t_defaultcollection",
         persist_directory: str = AppConstants.VECTOR_DB_LOC,
         embedding_model: str = AppConstants.EMBEDDING_MODEL,
-        llm_model: str = AppConstants.LLM_MODEL,  
+        # llm_model: Optional[str] = None,
+        # llm_provider: str = AppConstants.LLM_PROVIDER,
       
     ):
         
@@ -47,11 +52,57 @@ class RAGEngine:
             chunk_size=800,
             chunk_overlap=200
         )
-        if 'OPENAI_API_KEY' not in os.environ:
-            os.environ['OPENAI_API_KEY'] = AppConstants.OPEN_API_KEY
+        # selected_provider = (llm_provider or "openai").strip().lower()
+        # if selected_provider == "gemini":
+        #     selected_model = llm_model or AppConstants.GEMINI_MODEL
+        #     if ChatGoogleGenerativeAI is None:
+        #         raise ImportError(
+        #             "Gemini provider selected, but langchain_google_genai is not installed."
+        #         )
+        #     if "GOOGLE_API_KEY" not in os.environ:
+        #         os.environ["GOOGLE_API_KEY"] = AppConstants.GEMINI_API_KEY
+        #     self.llm = ChatGoogleGenerativeAI(
+        #         model=selected_model,
+        #         temperature=0,
+        #     )
+        # else:
+        #     selected_model = llm_model or AppConstants.LLM_MODEL
+        #     if "OPENAI_API_KEY" not in os.environ:
+        #         os.environ["OPENAI_API_KEY"] = AppConstants.OPENAI_API_KEY
+        #     self.llm = OpenAI(model_name=selected_model, temperature=0, max_tokens=500)
+        
+        # if "GOOGLE_API_KEY" not in os.environ:
+        #         os.environ["GOOGLE_API_KEY"] = AppConstants.GEMINI_API_KEY
 
-    
-        self.llm = OpenAI(model_name=llm_model, temperature=0, max_tokens=500)
+
+        # self.llm = ChatGoogleGenerativeAI(model=AppConstants.GEMINI_MODEL, temperature=0)
+
+        if "OPENAI_API_KEY" not in os.environ:
+                os.environ["OPENAI_API_KEY"] = AppConstants.OPENAI_API_KEY
+
+        self.llm = OpenAI(model_name=AppConstants.LLM_MODEL, temperature=0, max_tokens=500)
+
+
+        self.prompt_template_All_VehicleSummary = PromptTemplate(
+    template=(
+        "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
+        "Conversation history:\n{chat_history}\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Extract and list all vehicle summary details from the context, organized vehicle-wise.\n\n"
+        "Return a clean, presentable response in this format:\n"
+        "For each vehicle in the context:\n\n"
+        "**Vehicle: [Vehicle Name/Model] **\n"
+        "1) Summary: one short paragraph.\n"
+        "2) Key points: 2-5 bullet points.\n"
+        "3) Data used: short line mentioning important values from context.\n\n"
+        "If the context does not contain vehicle summary data, say: "
+        "\"I could not find this in the provided data.\""
+    ),
+    input_variables=["chat_history", "context", "question"],
+)
+
+
 
         # RAG prompt
         self. prompt_template_RAG = PromptTemplate(
@@ -91,13 +142,6 @@ class RAGEngine:
             cls._chat_histories[session_id] = InMemoryChatMessageHistory()
         return cls._chat_histories[session_id]
 
-
-    @classmethod
-    def _get_or_create_history(cls, session_id: str) -> InMemoryChatMessageHistory:
-        if session_id not in cls._chat_histories:
-            cls._chat_histories[session_id] = InMemoryChatMessageHistory()
-        return cls._chat_histories[session_id]
-
     @staticmethod
     def _format_recent_history(history: InMemoryChatMessageHistory, max_messages: int = 10) -> str:
         messages = history.messages[-max_messages:]
@@ -110,12 +154,34 @@ class RAGEngine:
             lines.append(f"{role}: {msg.content}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _llm_response_to_text(response: Any) -> str:
+        if isinstance(response, str):
+            return response.strip()
+
+        content = getattr(response, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("text"):
+                    text_parts.append(str(item["text"]))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            if text_parts:
+                return " ".join(text_parts).strip()
+
+        return str(response).strip()
+
     def get_or_create_collection(self, collection_name: str) -> Chroma:
         return Chroma(
             collection_name=collection_name,
             persist_directory=self.persist_directory,
             embedding_function=self.embedding_function,
         )
+    
 
     def _get_records_by_metadata(
         self,
@@ -161,6 +227,7 @@ class RAGEngine:
     def _is_general_vehicle_query(query: str) -> bool:
         normalized = query.lower()
         general_markers = [
+            "vehicle summary",
             "all vehicle",
             "all vehicles",
             "every vehicle",
@@ -180,8 +247,13 @@ class RAGEngine:
         vehicle_id_key: str = "vehicleid",
         k: int = 5,
         session_id: str = "default",
+        claims: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        
+
+
         session_id = session_id or "default"
+        claims = claims or {}
         history = self._get_or_create_history(session_id)
         is_general_query = self._is_general_vehicle_query(query)
         vehicle_name = self._extract_vehicle_name_from_query(query)
@@ -242,14 +314,14 @@ class RAGEngine:
             summary_docs = summary_db.similarity_search(
                 query=query,
                 k=k,
-                filter={vehicle_id_key: vehicle_id},
+                filter={vehicle_id_key: vehicle_id, 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
             )
 
             if not summary_docs and vehicle_id.isdigit():
                 summary_docs = summary_db.similarity_search(
                     query=query,
                     k=k,
-                    filter={vehicle_id_key: int(vehicle_id)},
+                    filter={vehicle_id_key: int(vehicle_id), 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
                 )
 
             if summary_docs:
@@ -264,12 +336,13 @@ class RAGEngine:
             else:
                 summary_records = self._get_records_by_metadata(
                     collection_name=summary_collection,
-                    where={vehicle_id_key: vehicle_id},
+                    where={vehicle_id_key: vehicle_id, 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
+
                 )
                 if not (summary_records.get("ids") or []) and vehicle_id.isdigit():
                     summary_records = self._get_records_by_metadata(
                         collection_name=summary_collection,
-                        where={vehicle_id_key: int(vehicle_id)},
+                    where={vehicle_id_key: int(vehicle_id), 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
                     )
 
                 ids = summary_records.get("ids") or []
@@ -304,14 +377,18 @@ class RAGEngine:
             [str(item.get("document", "")) for item in results if item.get("document")]
         )
 
-        prompt = self.prompt_template_RAG.format(
+        prompt = self.prompt_template_All_VehicleSummary.format(
             chat_history=self._format_recent_history(history),
             context=context,
             question=query
         )
 
+
+
+
+
         answer = self.llm.invoke(prompt)
-        answer_text = answer.strip() if isinstance(answer, str) else str(answer).strip()
+        answer_text = self._llm_response_to_text(answer)
         history.add_message(HumanMessage(content=query))
         history.add_message(AIMessage(content=answer_text))
 
@@ -351,14 +428,8 @@ class RAGEngine:
         docs = self.vectorstore.similarity_search(
         query=req.query,
         k=req.k,
-        filter=filter_dict1
-    )
+        filter=filter_dict1)
         
-        
-        
-
-
-
 
         logger.info(f"docs ---> {docs}")
         context_texts = [d.page_content for d in docs]
@@ -372,8 +443,7 @@ class RAGEngine:
                 "sources": [],
                 "chunks": []
             }
-        
-        
+             
 
         prompt = self.prompt_template_RAG.format(
             chat_history=self._format_recent_history(history),
@@ -382,7 +452,7 @@ class RAGEngine:
         )
 
         response = self.llm.invoke(prompt)
-        answer_text = response.strip() if isinstance(response, str) else str(response).strip()
+        answer_text = self._llm_response_to_text(response)
         history.add_message(HumanMessage(content=req.query))
         history.add_message(AIMessage(content=answer_text))
         # self.conversation_history.append(HumanMessage(content=question))
@@ -413,78 +483,6 @@ class RAGEngine:
               "chunks": context_texts}
 
 
-#     def add_json_from_api(self, url: str):
-
-         
-#         login_url = AppConstants.OBD_LOGIN_URL
-    
-#         payload_login = AppConstants.OBD_LOGIN_CREDENTIAL
-
-#         # Send login request
-#         loginResponse = requests.post(login_url, json=payload_login, verify=False)
-#         loginResponse_JSON = loginResponse.json()
-
-#         print("Login Response:", loginResponse_JSON)
-
-#         payload = {
-#     "columnName": "CREATED_DATE",
-#     "customerId": "-1",
-#     "dealerId": 0,
-#     "driverId": "-1",
-#     "fleetId": "-1",
-#     "loggedinOrgId": 113779,
-#     "orderDir": "desc",
-#     "orgId": 113779,
-#     "orgType": "-1",
-#     "orgTypeFilter": "-1",
-#     "page": 0,
-#     "regionId": 0,
-#     "resellerId": 113779,
-#     "roleId": 17,
-#     "searchText": "",
-#     "size": 25,
-#     "subResellerId": "-1"
-# }
-
-#         access_token = loginResponse_JSON.get("accessToken")
-
-#         headers = {"Authorization": f"Bearer {access_token}","Accept": "application/json"}
-
-#         response = requests.post(url, json=payload, headers=headers, verify=False)
-#         response.raise_for_status()
-
-#         json_data = response.json()
-        
-#         print("List User Response: --->", json_data)
-        
-#         print("json_string:--->",json_data)
-#         # convert json to docs  
-#         docs = []
-
-#         def flatten(obj, prefix=""):
-#              if isinstance(obj, dict):
-#                  for k, v in obj.items():
-#                     flatten(v, prefix + k + ".")
-#              elif isinstance(obj, list):
-#                  for i, v in enumerate(obj):
-#                     flatten(v, prefix + str(i) + ".")
-#              else:
-#                 docs.append(Document(page_content=f"{prefix[:-1]}: {obj}"))
-
-#         flatten(json_data)
-#         print(docs)
-#         # chunking
-#         chunks = self.splitter.split_documents(docs)
-
-#         if not chunks:
-#             return {"added": 0, "message": "No chunks created from API JSON"}
-
-#         self.vectorstore.add_documents(chunks)
-#         self.vectorstore.persist()
-
-#         return {"added": len(chunks)}
-
-
     def persist(self):
         self.vectorstore.persist()
 
@@ -502,7 +500,7 @@ class RAGEngine:
         logger.info(f"promptGeneral -----> {promptGeneral}")
 
         response = self.llm.invoke(promptGeneral)
-        answer_text = response.strip() if isinstance(response, str) else str(response).strip()
+        answer_text = self._llm_response_to_text(response)
         history.add_message(HumanMessage(content=req.query))
         history.add_message(AIMessage(content=answer_text))
 
