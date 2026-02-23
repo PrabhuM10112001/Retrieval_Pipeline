@@ -25,6 +25,8 @@ from logger import logger
 
 class RAGEngine:
     _chat_histories:  Dict[str, InMemoryChatMessageHistory] = {}
+    _CONTEXT_BUDGET_TOKENS = 12000
+    _RESERVED_COMPLETION_TOKENS = 500
     def __init__(
         self,
         collection_name: str = "t_defaultcollection",
@@ -89,7 +91,7 @@ class RAGEngine:
         "Conversation history:\n{chat_history}\n\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n\n"
-        "Extract and list all vehicle summary details from the context, organized vehicle-wise.\n\n"
+        "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
         "Return a clean, presentable response in this format:\n"
         "For each vehicle in the context:\n\n"
         "**Vehicle: [Vehicle Name/Model] **\n"
@@ -143,7 +145,11 @@ class RAGEngine:
         return cls._chat_histories[session_id]
 
     @staticmethod
-    def _format_recent_history(history: InMemoryChatMessageHistory, max_messages: int = 10) -> str:
+    def _format_recent_history(
+        history: InMemoryChatMessageHistory,
+        max_messages: int = 6,
+        max_chars_per_message: int = 1200,
+    ) -> str:
         messages = history.messages[-max_messages:]
         if not messages:
             return "No previous conversation."
@@ -151,7 +157,10 @@ class RAGEngine:
         lines: List[str] = []
         for msg in messages:
             role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-            lines.append(f"{role}: {msg.content}")
+            content = str(msg.content)
+            if len(content) > max_chars_per_message:
+                content = f"{content[:max_chars_per_message]}..."
+            lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
     @staticmethod
@@ -199,8 +208,8 @@ class RAGEngine:
         self,
         vehicle_name: str,
         vehicleid_collection: str,
-        vehicle_name_key: str = "vehicleNo",
-        vehicle_id_key: str = "vehicleid",
+        vehicle_name_key: str = "VEHICLE_NO",
+        vehicle_id_key: str = "VEHICLE_ID",
     ) -> Optional[str]:
         records = self._get_records_by_metadata(
             collection_name=vehicleid_collection,
@@ -238,13 +247,168 @@ class RAGEngine:
         ]
         return any(marker in normalized for marker in general_markers)
 
+    @staticmethod
+    def _build_where_filter(filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        cleaned = {k: v for k, v in filters.items() if v is not None}
+        if not cleaned:
+            return None
+        if len(cleaned) == 1:
+            return cleaned
+        return {"$and": [{k: v} for k, v in cleaned.items()]}
+
+    @staticmethod
+    def _coerce_filter_value(value: Any) -> Any:
+        # Chroma metadata matching is type-sensitive; coerce numeric-like claims.
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isdigit():
+                return int(stripped)
+            return stripped
+        return value
+
+    @staticmethod
+    def _pick_metadata_value(metadata: Dict[str, Any], keys: List[str]) -> Optional[str]:
+        for key in keys:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+        lowered = {str(k).lower(): v for k, v in metadata.items()}
+        for key in keys:
+            value = lowered.get(key.lower())
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Rough approximation for English text to prevent prompt overflow.
+        return max(1, len(text) // 4)
+
+    def _build_bounded_context(
+        self,
+        docs: List[str],
+        token_budget: int,
+    ) -> str:
+        if not docs:
+            return ""
+
+        pieces: List[str] = []
+        used_tokens = 0
+
+        for doc in docs:
+            text = str(doc or "").strip()
+            if not text:
+                continue
+            part_tokens = self._estimate_tokens(text) + 2
+            if used_tokens + part_tokens > token_budget:
+                break
+            pieces.append(text)
+            used_tokens += part_tokens
+
+        return "\n\n---\n\n".join(pieces)
+
+    def _format_all_vehicle_response(
+        self,
+        results: List[Dict[str, Any]],
+        vehicle_name_key: str,
+        vehicle_id_key: str,
+    ) -> str:
+        if not results:
+            return "I could not find this in the provided data."
+
+        blocks: List[str] = []
+        for index, item in enumerate(results, start=1):
+            metadata = item.get("metadata") or {}
+            document_text = self._normalize_text(item.get("document", ""))
+
+            vehicle_label = self._pick_metadata_value(
+                metadata,
+                [
+                    vehicle_name_key,
+                    "VEHICLE_NO",
+                    "vehicleNo",
+                    "vehicle_name",
+                    "vehicleno",
+                    vehicle_id_key,
+                    "VEHICLE_ID",
+                    "vehicleId",
+                    "vehicleid",
+                ],
+            ) or f"UNKNOWN_{index}"
+
+            date_value = self._pick_metadata_value(
+                metadata, ["DATE", "date", "MSGDATE", "msgdate"]
+            )
+            distance_value = self._pick_metadata_value(
+                metadata,
+                [
+                    "DISTANCE",
+                    "distance",
+                    "TOTAL_DISTANCE",
+                    "total_distance",
+                    "KM",
+                    "km",
+                ],
+            )
+            start_time = self._pick_metadata_value(
+                metadata, ["START_TIME", "start_time", "FROM_TIME", "from_time", "start"]
+            )
+            end_time = self._pick_metadata_value(
+                metadata, ["END_TIME", "end_time", "TO_TIME", "to_time", "end"]
+            )
+
+            summary_text = document_text or "No summary text found in the record."
+            if len(summary_text) > 240:
+                summary_text = f"{summary_text[:237]}..."
+
+            key_points: List[str] = []
+            if date_value:
+                key_points.append(f"- Date: {date_value}")
+            if distance_value:
+                key_points.append(f"- Distance: {distance_value}")
+            if start_time or end_time:
+                key_points.append(
+                    f"- Time: {(start_time or 'N/A')} to {(end_time or 'N/A')}"
+                )
+
+            if not key_points and metadata:
+                for key, value in list(metadata.items())[:3]:
+                    if value not in (None, ""):
+                        key_points.append(f"- {key}: {value}")
+
+            data_used_values = [v for v in [distance_value, start_time, end_time] if v]
+            if data_used_values:
+                data_used = ", ".join(data_used_values)
+            elif document_text:
+                data_used = summary_text
+            else:
+                data_used = "N/A"
+
+            key_points_text = "\n".join([f"   {point}" for point in key_points]) or "   - N/A"
+
+            block = (
+                f"---\n\n"
+                f"**Vehicle: {vehicle_label}**\n"
+                f"1) Summary: {summary_text}\n"
+                f"2) Key points:\n{key_points_text}\n"
+                f"3) Data used: {data_used}"
+            )
+            blocks.append(block)
+
+        return "\n\n".join(blocks)
+
     def get_vehicle_summary_by_name(
         self,
         query: str,
         vehicleid_collection: str,
         summary_collection: str,
-        vehicle_name_key: str = "vehicleNo",
-        vehicle_id_key: str = "vehicleid",
+        vehicle_name_key: str = "VEHICLE_NO",
+        vehicle_id_key: str = "VEHICLE_ID",
         k: int = 5,
         session_id: str = "default",
         claims: Optional[Dict[str, Any]] = None,
@@ -281,10 +445,30 @@ class RAGEngine:
 
         summary_db = self.get_or_create_collection(summary_collection)
         results: List[Dict[str, Any]] = []
+        claims_filter = {
+            "RESELLER_ID": self._coerce_filter_value(claims.get("resellerId")),
+            "CUSTOMER_ID": self._coerce_filter_value(claims.get("customerId")),
+            "ORG_ID": self._coerce_filter_value(claims.get("orgId")),
+            "DEALER_ID": self._coerce_filter_value(claims.get("dealerId")),
+        }
+
+
+        # claims_filter = {
+        #     "RESELLER_ID": 116606,
+        #     "CUSTOMER_ID": 116657,
+        #     "ORG_ID": 116659,
+        #     "DEALER_ID": 116652,
+        # }
+         
+
+        claims_where = self._build_where_filter(claims_filter)
 
         if vehicle_id is None and is_general_query:
             vehicle_name = "ALL_VEHICLES"
-            all_records = summary_db.get()
+            if claims_where:
+                all_records = summary_db.get(where=claims_where)
+            else:
+                all_records = summary_db.get()
             ids = all_records.get("ids") or []
             docs = all_records.get("documents") or []
             metas = all_records.get("metadatas") or []
@@ -311,17 +495,24 @@ class RAGEngine:
                 "results": [],
             }
         else:
+            string_where = self._build_where_filter(
+                {vehicle_id_key: vehicle_id, **claims_filter}
+            )
+            int_where = self._build_where_filter(
+                {vehicle_id_key: int(vehicle_id), **claims_filter}
+            ) if vehicle_id.isdigit() else None
+
             summary_docs = summary_db.similarity_search(
                 query=query,
                 k=k,
-                filter={vehicle_id_key: vehicle_id, 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
+                filter=string_where,
             )
 
             if not summary_docs and vehicle_id.isdigit():
                 summary_docs = summary_db.similarity_search(
                     query=query,
                     k=k,
-                    filter={vehicle_id_key: int(vehicle_id), 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
+                    filter=int_where,
                 )
 
             if summary_docs:
@@ -336,13 +527,13 @@ class RAGEngine:
             else:
                 summary_records = self._get_records_by_metadata(
                     collection_name=summary_collection,
-                    where={vehicle_id_key: vehicle_id, 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
+                    where=string_where,
 
                 )
                 if not (summary_records.get("ids") or []) and vehicle_id.isdigit():
                     summary_records = self._get_records_by_metadata(
                         collection_name=summary_collection,
-                    where={vehicle_id_key: int(vehicle_id), 'RESELLER_ID': claims.get("resellerId"), 'CUSTOMER_ID': claims.get("customerId"), 'ORG_ID': claims.get("orgId"), 'DEALER_ID': claims.get("dealerId")},
+                    where=int_where,
                     )
 
                 ids = summary_records.get("ids") or []
@@ -373,11 +564,44 @@ class RAGEngine:
                 "results": [],
             }
 
-        context = "\n\n---\n\n".join(
-            [str(item.get("document", "")) for item in results if item.get("document")]
-        )
+        if is_general_query and vehicle_id is None:
+            answer_text = self._format_all_vehicle_response(
+                results=results,
+                vehicle_name_key=vehicle_name_key,
+                vehicle_id_key=vehicle_id_key,
+            )
+            history.add_message(HumanMessage(content=query))
+            history.add_message(AIMessage(content=answer_text))
+            return {
+                "query": query,
+                "vehicle_name": vehicle_name,
+                "vehicle_id": vehicle_id,
+                "session_id": session_id,
+                "response": answer_text,
+                # "results": results,
+                "is_general_query": is_general_query,
+            }
 
-        prompt = self.prompt_template_All_VehicleSummary.format(
+        context_docs = [str(item.get("document", "")) for item in results if item.get("document")]
+        context = self._build_bounded_context(
+            context_docs,
+            token_budget=self._CONTEXT_BUDGET_TOKENS,
+        )
+        if not context:
+            answer_text = "I could not find this in the provided data."
+            history.add_message(HumanMessage(content=query))
+            history.add_message(AIMessage(content=answer_text))
+            return {
+                "query": query,
+                "vehicle_name": vehicle_name,
+                "vehicle_id": vehicle_id,
+                "session_id": session_id,
+                "response": answer_text,
+                "results": [],
+                "is_general_query": is_general_query,
+            }
+
+        prompt = self.prompt_template_RAG.format(
             chat_history=self._format_recent_history(history),
             context=context,
             question=query
@@ -435,7 +659,10 @@ class RAGEngine:
         context_texts = [d.page_content for d in docs]
         sources = [d.metadata for d in docs]
 
-        context = "\n\n---\n\n".join(context_texts)
+        context = self._build_bounded_context(
+            context_texts,
+            token_budget=self._CONTEXT_BUDGET_TOKENS,
+        )
         logger.info(f"context ---> {context}")
         if not context:
             return {
