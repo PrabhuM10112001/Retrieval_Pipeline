@@ -4,7 +4,7 @@ import os
 class AppConstants:
 
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     VECTOR_DB_LOC = "/home/prabhu/Music/Vector_DB"
     # OBD_LOGIN_URL = "https://ukapi.nesh.live:9443/authenticate"
     # OBD_LOGIN_CREDENTIAL = {
