@@ -88,20 +88,21 @@ class RAGEngine:
         self.prompt_template_All_VehicleSummary = PromptTemplate(
     template=(
         "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
-        "Conversation history:\n{chat_history}\n\n"
+        # "Conversation history:\n{chat_history}\n\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n\n"
         "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
         "Return a clean, presentable response in this format:\n"
         "For each vehicle in the context:\n\n"
-        "**Vehicle: [Vehicle Name/Model] **\n"
+        "**Vehicle: [Vehicle NO] **\n"
+        "Hide RESELLER_ID, CUSTOMER_ID, ORG_ID, DEALER_ID in the response.\n"
         "1) Summary: one short paragraph.\n"
-        "2) Key points: 2-5 bullet points.\n"
-        "3) Data used: short line mentioning important values from context.\n\n"
-        "If the context does not contain vehicle summary data, say: "
-        "\"I could not find this in the provided data.\""
+        "2) Summary points: List all the parameters values.\n"
+        # "If the context does not contain vehicle summary data, say: "
+        # "\"I could not find this in the provided data.\""
+        # "chat_history",
     ),
-    input_variables=["chat_history", "context", "question"],
+    input_variables=["context", "question"],
 )
 
 
@@ -110,7 +111,7 @@ class RAGEngine:
         self. prompt_template_RAG = PromptTemplate(
             template=(
                 "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
-                "Conversation history:\n{chat_history}\n\n"
+                # "Conversation history:\n{chat_history}\n\n"
                 "Context:\n{context}\n\n"
                 "Question: {question}\n\n"
                 "Return a clean, presentable response in this format:\n"
@@ -119,9 +120,9 @@ class RAGEngine:
                 "3) Data used: short line mentioning important values from context.\n\n"
                 "If the context does not contain the answer, say: "
                 "\"I could not find this in the provided data.\""
-
+                # chat_history
             ),
-            input_variables=["chat_history", "context", "question"],
+            input_variables=["context", "question"],
         )
         self.prompt_template_General = PromptTemplate(
     template=(
@@ -237,6 +238,10 @@ class RAGEngine:
         normalized = query.lower()
         general_markers = [
             "vehicle summary",
+            "active vehicles",
+            "vehicles",
+            "vehicle-wise summary",
+            "vehicles summary",
             "all vehicle",
             "all vehicles",
             "every vehicle",
@@ -246,6 +251,43 @@ class RAGEngine:
             "general summary",
         ]
         return any(marker in normalized for marker in general_markers)
+
+    @staticmethod
+    def _is_active_vehicle_count_query(query: str) -> bool:
+        normalized = query.lower()
+        has_count_intent = any(
+            marker in normalized for marker in ["how many", "count", "number of", "total"]
+        )
+        has_vehicle_intent = "vehicle" in normalized
+        has_active_intent = "active" in normalized
+        return has_count_intent and has_vehicle_intent and has_active_intent
+
+    def _count_unique_vehicles(
+        self,
+        metadatas: List[Dict[str, Any]],
+        vehicle_name_key: str,
+        vehicle_id_key: str,
+    ) -> int:
+        unique_vehicles = set()
+        for metadata in metadatas:
+            metadata = metadata or {}
+            value = self._pick_metadata_value(
+                metadata,
+                [
+                    vehicle_name_key,
+                    "VEHICLE_NO",
+                    "vehicleNo",
+                    "vehicle_name",
+                    "vehicleno",
+                    vehicle_id_key,
+                    "VEHICLE_ID",
+                    "vehicleId",
+                    "vehicleid",
+                ],
+            )
+            if value:
+                unique_vehicles.add(str(value))
+        return len(unique_vehicles)
 
     @staticmethod
     def _build_where_filter(filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -461,7 +503,40 @@ class RAGEngine:
         # }
          
 
+        # claims_filter = {
+        #     "RESELLER_ID": 116606,
+        #     "CUSTOMER_ID": 116657,
+        #     "ORG_ID": 116659,
+        #     "DEALER_ID": 116652,
+        #     "RESELLER_ID": self._coerce_filter_value(claims.get("resellerId")),
+        #     "CUSTOMER_ID": self._coerce_filter_value(claims.get("customerId")),
+        #     "ORG_ID": self._coerce_filter_value(claims.get("orgId")),
+        #     "DEALER_ID": self._coerce_filter_value(claims.get("dealerId")),
+        # }
+         
+
         claims_where = self._build_where_filter(claims_filter)
+
+        if self._is_active_vehicle_count_query(query):
+            records = summary_db.get(where=claims_where) if claims_where else summary_db.get()
+            metadatas = records.get("metadatas") or []
+            active_vehicle_count = self._count_unique_vehicles(
+                metadatas=metadatas,
+                vehicle_name_key=vehicle_name_key,
+                vehicle_id_key=vehicle_id_key,
+            )
+            answer_text = f"There are {active_vehicle_count} active vehicles."
+            history.add_message(HumanMessage(content=query))
+            history.add_message(AIMessage(content=answer_text))
+            return {
+                "query": query,
+                "vehicle_name": "ALL_VEHICLES",
+                "vehicle_id": None,
+                "session_id": session_id,
+                "response": answer_text,
+                "active_vehicle_count": active_vehicle_count,
+                "is_general_query": True,
+            }
 
         if vehicle_id is None and is_general_query:
             vehicle_name = "ALL_VEHICLES"
@@ -502,54 +577,30 @@ class RAGEngine:
                 {vehicle_id_key: int(vehicle_id), **claims_filter}
             ) if vehicle_id.isdigit() else None
 
-            summary_docs = summary_db.similarity_search(
-                query=query,
-                k=k,
-                filter=string_where,
+            summary_records = self._get_records_by_metadata(
+                collection_name=summary_collection,
+                where=string_where,
             )
-
-            if not summary_docs and vehicle_id.isdigit():
-                summary_docs = summary_db.similarity_search(
-                    query=query,
-                    k=k,
-                    filter=int_where,
-                )
-
-            if summary_docs:
-                for doc in summary_docs:
-                    results.append(
-                        {
-                            "id": doc.metadata.get("id"),
-                            "document": doc.page_content,
-                            "metadata": doc.metadata,
-                        }
-                    )
-            else:
+            if not (summary_records.get("ids") or []) and vehicle_id.isdigit():
                 summary_records = self._get_records_by_metadata(
                     collection_name=summary_collection,
-                    where=string_where,
-
-                )
-                if not (summary_records.get("ids") or []) and vehicle_id.isdigit():
-                    summary_records = self._get_records_by_metadata(
-                        collection_name=summary_collection,
                     where=int_where,
-                    )
+                )
 
-                ids = summary_records.get("ids") or []
-                docs = summary_records.get("documents") or []
-                metas = summary_records.get("metadatas") or []
-                result_count = min(len(ids), len(docs), len(metas))
+            ids = summary_records.get("ids") or []
+            docs = summary_records.get("documents") or []
+            metas = summary_records.get("metadatas") or []
+            result_count = min(len(ids), len(docs), len(metas))
 
-                for i in range(result_count):
-                    results.append(
-                        {
-                            "id": ids[i],
-                            "document": docs[i],
-                            "vehicleNo": vehicle_name,
-                            "metadata": metas[i],
-                        }
-                    )
+            for i in range(result_count):
+                results.append(
+                    {
+                        "id": ids[i],
+                        "document": docs[i],
+                        "vehicleNo": vehicle_name,
+                        "metadata": metas[i],
+                    }
+                )
 
         if not results:
             answer_text = "I could not find this in the provided data."
@@ -564,23 +615,23 @@ class RAGEngine:
                 "results": [],
             }
 
-        if is_general_query and vehicle_id is None:
-            answer_text = self._format_all_vehicle_response(
-                results=results,
-                vehicle_name_key=vehicle_name_key,
-                vehicle_id_key=vehicle_id_key,
-            )
-            history.add_message(HumanMessage(content=query))
-            history.add_message(AIMessage(content=answer_text))
-            return {
-                "query": query,
-                "vehicle_name": vehicle_name,
-                "vehicle_id": vehicle_id,
-                "session_id": session_id,
-                "response": answer_text,
-                # "results": results,
-                "is_general_query": is_general_query,
-            }
+        # if is_general_query and vehicle_id is None:
+        #     answer_text = self._format_all_vehicle_response(
+        #         results=results,
+        #         vehicle_name_key=vehicle_name_key,
+        #         vehicle_id_key=vehicle_id_key,
+        #     )
+        #     history.add_message(HumanMessage(content=query))
+        #     history.add_message(AIMessage(content=answer_text))
+        #     return {
+        #         "query": query,
+        #         "vehicle_name": vehicle_name,
+        #         "vehicle_id": vehicle_id,
+        #         "session_id": session_id,
+        #         "response": answer_text,
+        #         # "results": results,
+        #         "is_general_query": is_general_query,
+        #     }
 
         context_docs = [str(item.get("document", "")) for item in results if item.get("document")]
         context = self._build_bounded_context(
@@ -606,10 +657,6 @@ class RAGEngine:
             context=context,
             question=query
         )
-
-
-
-
 
         answer = self.llm.invoke(prompt)
         answer_text = self._llm_response_to_text(answer)
@@ -687,6 +734,7 @@ class RAGEngine:
     
 
 
+
     #     messages = [
     #     self.system_message,
     #     *self.conversation_history,
@@ -719,7 +767,7 @@ class RAGEngine:
         session_id = req.session_id or "default"
         history = self._get_or_create_history(session_id)
 
-        promptGeneral = self.prompt_template_General.format(
+        promptGeneral = self.prompt_template_All_VehicleSummary.format(
             chat_history=self._format_recent_history(history),
             question=req.query
         )
