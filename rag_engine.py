@@ -11,11 +11,15 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 import json
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_openai import OpenAI
+from langchain_openai import ChatOpenAI
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except ImportError:
     ChatGoogleGenerativeAI = None
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from langchain_core.prompts import PromptTemplate
 from ApplicationConstants import AppConstants
 from Schemas import AskRequest, AskVehicleRequest
@@ -27,6 +31,7 @@ class RAGEngine:
     _chat_histories:  Dict[str, InMemoryChatMessageHistory] = {}
     _CONTEXT_BUDGET_TOKENS = 12000
     _RESERVED_COMPLETION_TOKENS = 500
+    _MAX_RESPONSE_TOKENS = 2000
     def __init__(
         self,
         collection_name: str = "t_defaultcollection",
@@ -82,28 +87,31 @@ class RAGEngine:
         if "OPENAI_API_KEY" not in os.environ:
                 os.environ["OPENAI_API_KEY"] = AppConstants.OPENAI_API_KEY
 
-        self.llm = OpenAI(model_name=AppConstants.LLM_MODEL, temperature=0, max_tokens=500)
+        self.llm = ChatOpenAI(
+            model=AppConstants.LLM_MODEL,
+            temperature=0,
+            max_tokens=self._MAX_RESPONSE_TOKENS,
+        )
 
 
         self.prompt_template_All_VehicleSummary = PromptTemplate(
     template=(
         "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
-        # "Conversation history:\n{chat_history}\n\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n\n"
         "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
+        "Output exactly one section per unique vehicle number. Do not repeat the same vehicle section.\n"
         "Return a clean, presentable response in this format:\n"
         "For each vehicle in the context:\n\n"
         "**Vehicle: [Vehicle NO] **\n"
-        "Hide RESELLER_ID, CUSTOMER_ID, ORG_ID, DEALER_ID in the response.\n"
+        "Never reveal RESELLER_ID, CUSTOMER_ID, ORG_ID, or DEALER_ID.\n"
+        "If these fields appear in context, omit them completely from output.\n"
         "1) Summary: one short paragraph.\n"
         "2) Summary points: List all the parameters values.\n"
-        # "If the context does not contain vehicle summary data, say: "
-        # "\"I could not find this in the provided data.\""
-        # "chat_history",
     ),
     input_variables=["context", "question"],
 )
+
 
 
 
@@ -138,6 +146,18 @@ class RAGEngine:
     ),
     input_variables=["chat_history", "question"],
 )
+        
+        self.prompt_template_query_status = PromptTemplate(
+    template=(
+        "Question: {question}\n"
+        "Analyse the question and Give simple answers only, generic or vehiclesummary-all or vehiclesummary-notall or none"
+        "Condition: If the question is generic related to vehicles answer: generic , if the question is related to vehicle summary of all vehicles answer: vehiclesummary-all , if the question is related to specific vehicle summary or particular vehicle summary answer: vehiclesummary-notall,if the question is not related to all the previous given conditions answer: none\n"
+    ),
+    input_variables=[ "question"],
+)
+  
+
+
   
     @classmethod
     def _get_or_create_history(cls, session_id: str) -> InMemoryChatMessageHistory:
@@ -290,13 +310,65 @@ class RAGEngine:
         return len(unique_vehicles)
 
     @staticmethod
-    def _build_where_filter(filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _build_where_filter(
+        filters: Dict[str, Any],
+        operator: str = "$and",
+    ) -> Optional[Dict[str, Any]]:
         cleaned = {k: v for k, v in filters.items() if v is not None}
         if not cleaned:
             return None
         if len(cleaned) == 1:
             return cleaned
-        return {"$and": [{k: v} for k, v in cleaned.items()]}
+        if operator not in {"$and", "$or"}:
+            operator = "$and"
+        return {operator: [{k: v} for k, v in cleaned.items()]}
+
+    @staticmethod
+    def _get_claim_value(claims: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            if key in claims and claims.get(key) not in (None, ""):
+                return claims.get(key)
+        lowered = {str(k).lower(): v for k, v in claims.items()}
+        for key in keys:
+            value = lowered.get(key.lower())
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _build_claims_where(self, claims: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        claim_specs = [
+            (["resellerId", "reseller_id", "RESELLER_ID", "resellerid"], ["RESELLER_ID", "resellerid", "resellerId"]),
+            (["customerId", "customer_id", "CUSTOMER_ID", "customerid"], ["CUSTOMER_ID", "customerid", "customerId"]),
+            (["orgId", "org_id", "ORG_ID", "orgid"], ["ORG_ID", "orgid", "orgId"]),
+            (["dealerId", "dealer_id", "DEALER_ID", "dealerid"], ["DEALER_ID", "dealerid", "dealerId"]),
+        ]
+
+        or_conditions: List[Dict[str, Any]] = []
+        for claim_keys, metadata_keys in claim_specs:
+            raw_value = self._get_claim_value(claims, claim_keys)
+            if raw_value in (None, ""):
+                continue
+            coerced_value = self._coerce_filter_value(raw_value)
+            value_variants = [coerced_value]
+            if isinstance(coerced_value, int):
+                value_variants.append(str(coerced_value))
+            elif isinstance(coerced_value, str) and coerced_value.isdigit():
+                value_variants.append(int(coerced_value))
+
+            seen = set()
+            for metadata_key in metadata_keys:
+                for value in value_variants:
+                    signature = (metadata_key, str(value))
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    or_conditions.append({metadata_key: value})
+
+        if not or_conditions:
+            return None
+        if len(or_conditions) == 1:
+            return or_conditions[0]
+        return {"$or": or_conditions}
 
     @staticmethod
     def _coerce_filter_value(value: Any) -> Any:
@@ -331,6 +403,34 @@ class RAGEngine:
         # Rough approximation for English text to prevent prompt overflow.
         return max(1, len(text) // 4)
 
+    def _count_tokens(self, text: str) -> int:
+        content = str(text or "")
+        if not content:
+            return 0
+        if tiktoken is not None:
+            try:
+                model_name = getattr(self.llm, "model_name", "") or ""
+                encoding = (
+                    tiktoken.encoding_for_model(model_name)
+                    if model_name
+                    else tiktoken.get_encoding("cl100k_base")
+                )
+                return len(encoding.encode(content))
+            except Exception:
+                pass
+        return self._estimate_tokens(content)
+
+    def _print_token_usage(self, prompt_text: str, output_text: str, route_name: str) -> None:
+        input_tokens = self._count_tokens(prompt_text)
+        output_tokens = self._count_tokens(output_text)
+        logger.info(
+            "[%s] input_tokens=%s output_tokens=%s",
+            route_name,
+            input_tokens,
+            output_tokens,
+        )
+        print(f"[{route_name}] input_tokens={input_tokens} output_tokens={output_tokens}")
+
     def _build_bounded_context(
         self,
         docs: List[str],
@@ -353,6 +453,44 @@ class RAGEngine:
             used_tokens += part_tokens
 
         return "\n\n---\n\n".join(pieces)
+
+    def _build_vehicle_grouped_context_docs(
+        self,
+        results: List[Dict[str, Any]],
+    ) -> List[str]:
+        grouped_docs: Dict[str, List[str]] = {}
+        seen_per_vehicle: Dict[str, set] = {}
+
+        for item in results:
+            document = self._normalize_text(item.get("document"))
+            if not document:
+                continue
+
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            vehicle_no = (
+                item.get("vehicleNo")
+                or metadata.get("VEHICLE_NO")
+                or metadata.get("vehicleNo")
+                or "UNKNOWN"
+            )
+            vehicle_no = str(vehicle_no).strip() or "UNKNOWN"
+
+            if vehicle_no not in grouped_docs:
+                grouped_docs[vehicle_no] = []
+                seen_per_vehicle[vehicle_no] = set()
+
+            if document in seen_per_vehicle[vehicle_no]:
+                continue
+
+            seen_per_vehicle[vehicle_no].add(document)
+            grouped_docs[vehicle_no].append(document)
+
+        context_docs: List[str] = []
+        for vehicle_no, docs in grouped_docs.items():
+            merged_document = "\n".join(docs)
+            context_docs.append(f"VehicleNo: {vehicle_no}\nDocument:\n{merged_document}")
+
+        return context_docs
 
     def _format_all_vehicle_response(
         self,
@@ -487,12 +625,9 @@ class RAGEngine:
 
         summary_db = self.get_or_create_collection(summary_collection)
         results: List[Dict[str, Any]] = []
-        claims_filter = {
-            "RESELLER_ID": self._coerce_filter_value(claims.get("resellerId")),
-            "CUSTOMER_ID": self._coerce_filter_value(claims.get("customerId")),
-            "ORG_ID": self._coerce_filter_value(claims.get("orgId")),
-            "DEALER_ID": self._coerce_filter_value(claims.get("dealerId")),
-        }
+        claims_where = self._build_claims_where(claims)
+        logger.info("JWT claims received: %s", claims)
+        logger.info("Resolved claims_where filter: %s", claims_where)
 
 
         # claims_filter = {
@@ -514,8 +649,6 @@ class RAGEngine:
         #     "DEALER_ID": self._coerce_filter_value(claims.get("dealerId")),
         # }
          
-
-        claims_where = self._build_where_filter(claims_filter)
 
         if self._is_active_vehicle_count_query(query):
             records = summary_db.get(where=claims_where) if claims_where else summary_db.get()
@@ -550,10 +683,16 @@ class RAGEngine:
             result_count = min(len(ids), len(docs), len(metas))
 
             for i in range(result_count):
+                vehicle_no = (
+                    metas[i].get("VEHICLE_NO")
+                    if isinstance(metas[i], dict)
+                    else None
+                )
                 results.append(
                     {
                         "id": ids[i],
                         "document": docs[i],
+                        "vehicleNo": vehicle_no,
                         "metadata": metas[i],
                     }
                 )
@@ -570,12 +709,15 @@ class RAGEngine:
                 "results": [],
             }
         else:
-            string_where = self._build_where_filter(
-                {vehicle_id_key: vehicle_id, **claims_filter}
-            )
-            int_where = self._build_where_filter(
-                {vehicle_id_key: int(vehicle_id), **claims_filter}
-            ) if vehicle_id.isdigit() else None
+            string_where: Dict[str, Any] = {vehicle_id_key: vehicle_id}
+            if claims_where:
+                string_where = {"$and": [{vehicle_id_key: vehicle_id}, claims_where]}
+
+            int_where: Optional[Dict[str, Any]] = None
+            if vehicle_id.isdigit():
+                int_where = {vehicle_id_key: int(vehicle_id)}
+                if claims_where:
+                    int_where = {"$and": [{vehicle_id_key: int(vehicle_id)}, claims_where]}
 
             summary_records = self._get_records_by_metadata(
                 collection_name=summary_collection,
@@ -633,7 +775,7 @@ class RAGEngine:
         #         "is_general_query": is_general_query,
         #     }
 
-        context_docs = [str(item.get("document", "")) for item in results if item.get("document")]
+        context_docs = self._build_vehicle_grouped_context_docs(results)
         context = self._build_bounded_context(
             context_docs,
             token_budget=self._CONTEXT_BUDGET_TOKENS,
@@ -652,7 +794,7 @@ class RAGEngine:
                 "is_general_query": is_general_query,
             }
 
-        prompt = self.prompt_template_RAG.format(
+        prompt = self.prompt_template_All_VehicleSummary.format(
             chat_history=self._format_recent_history(history),
             context=context,
             question=query
@@ -660,6 +802,7 @@ class RAGEngine:
 
         answer = self.llm.invoke(prompt)
         answer_text = self._llm_response_to_text(answer)
+        self._print_token_usage(prompt, answer_text, "vehiclesummary")
         history.add_message(HumanMessage(content=query))
         history.add_message(AIMessage(content=answer_text))
 
@@ -719,7 +862,7 @@ class RAGEngine:
             }
              
 
-        prompt = self.prompt_template_RAG.format(
+        prompt = self.prompt_template_All_VehicleSummary.format(
             chat_history=self._format_recent_history(history),
             context=context,
             question=req.query
@@ -727,6 +870,7 @@ class RAGEngine:
 
         response = self.llm.invoke(prompt)
         answer_text = self._llm_response_to_text(response)
+        self._print_token_usage(prompt, answer_text, "ask_RAG")
         history.add_message(HumanMessage(content=req.query))
         history.add_message(AIMessage(content=answer_text))
         # self.conversation_history.append(HumanMessage(content=question))
@@ -762,26 +906,50 @@ class RAGEngine:
         self.vectorstore.persist()
 
 
-    def answer_vehicle(self, req: AskVehicleRequest):
+    def answer_vehicle(self, query: str):
      try:
-        session_id = req.session_id or "default"
+        session_id = "default"
         history = self._get_or_create_history(session_id)
 
-        promptGeneral = self.prompt_template_All_VehicleSummary.format(
+        promptGeneral = self.prompt_template_General.format(
             chat_history=self._format_recent_history(history),
-            question=req.query
+            question=query
         )
 
         logger.info(f"promptGeneral -----> {promptGeneral}")
 
         response = self.llm.invoke(promptGeneral)
         answer_text = self._llm_response_to_text(response)
-        history.add_message(HumanMessage(content=req.query))
+        self._print_token_usage(promptGeneral, answer_text, "ask_Vehicles")
+        history.add_message(HumanMessage(content=query))
         history.add_message(AIMessage(content=answer_text))
 
         return {"answer": answer_text, "session_id": session_id}
      except Exception as e:
         logger.error(f"Error in answer_vehicle: {e}")
+        return {"answer": "An error occurred while processing your request."}
+     
+
+    def query_status_check(self, query: str):
+     try:
+        session_id = "default"
+        history = self._get_or_create_history(session_id)
+
+        promptGeneral = self.prompt_template_query_status.format(
+            question=query
+        )
+
+        logger.info(f"promptGeneral -----> {promptGeneral}")
+
+        response = self.llm.invoke(promptGeneral)
+        answer_text = self._llm_response_to_text(response)
+        self._print_token_usage(promptGeneral, answer_text, "query_status_check")
+        history.add_message(HumanMessage(content=query))
+        history.add_message(AIMessage(content=answer_text))
+
+        return answer_text
+     except Exception as e:
+        logger.error(f"Error in query_status_check: {e}")
         return {"answer": "An error occurred while processing your request."}
 
    
