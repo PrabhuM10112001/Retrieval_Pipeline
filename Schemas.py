@@ -29,8 +29,7 @@ class AskVehicleRequest(BaseModel):
 
 class VehicleSummaryByNameRequest(BaseModel):
     query: str
-    vehicleid_collection: str
-    summary_collection: str
+    vehicleid_collection: str 
     vehicle_name_key: str = "vehicleNo"
     vehicle_id_key: str = "vehicleid"
     k: int = 5

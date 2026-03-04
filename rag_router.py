@@ -50,7 +50,17 @@ RAG = RAGEngine()
 @router.get("/")
 def root():
     return {"message": "RAG FastAPI is running!"} 
-     
+
+
+@router.get("/get_userrole")
+def getuserrole(claims: dict = Depends(jwt_filter)):
+
+    response = RAG.get_userrole(claims=claims)
+    return response
+
+
+
+         
 
 @router.post("/ask_RAG")
 def ask(req: AskRequest):
@@ -61,7 +71,7 @@ def ask(req: AskRequest):
 
 @router.post("/ask_Vehicles")
 def add_json(req: AskVehicleRequest):
-    result = RAG.answer_vehicle(req)
+    result = RAG.answer_vehicle(req.query, session_id=req.session_id)
     return result
 
 
@@ -70,55 +80,62 @@ def chatbot_rag_method(
     req: VehicleSummaryByNameRequest,
     claims: dict = Depends(jwt_filter),
 ):
-        
-        result = RAG.query_status_check(req.query)
-        
+    session_id = req.session_id or "default"
+    result = RAG.query_status_check(
+        query=req.query,
+        session_id=session_id,
+        use_history_for_classification=True,
+    )
 
-        if result == "Generic" or result == "generic":
-
-             vehicleResult = RAG.answer_vehicle(req.query) 
-
-             return {
-
+    if result == "generic":
+        vehicle_result = RAG.answer_vehicle(
+            query=req.query,
+            session_id=session_id,
+            persist_history=False,
+        )
+        response_payload = {
             "query": req.query,
-            "session_id": req.session_id,
-            "response": vehicleResult,
+            "session_id": session_id,
+            "response": vehicle_result,
             "results": [],
         }
+    elif result == "vehicledetail" :
+
+        response_payload = RAG.get_vehicle_detail(
+            query=req.query,
+            vehicle_detail_collection=req.vehicleid_collection,
+            session_id=session_id,
+            claims=claims,
+            persist_history=False,
+        )
+         
 
 
-        elif result == "Vehiclesummary-all" or result == "vehiclesummary-all" or result == "Vehiclesummary-notall" or result == "vehiclesummary-notall":
-
-        #      return {
-        #     "query": req.query,
-        #     "session_id": req.session_id,
-        #     "response": "Please ask only generic vehicle-related questions.",
-        #     "results": [],
-        # }
-        # return {
-        #     "query": req.query,
-        #     "session_id": req.session_id,
-        #     "response": "Please ask only generic vehicle-related questions.",
-        #     "results": [],
-        # }
-
-            vehicleSummaryResult = RAG.get_vehicle_summary_by_name(
-        query=req.query,
-        vehicleid_collection=req.vehicleid_collection,
-        summary_collection=req.summary_collection,
-        vehicle_name_key="VEHICLE_NO",
-        vehicle_id_key="VEHICLE_ID",
-        k=req.k,
-        session_id=req.session_id,
-        claims=claims,
-    )
-            return vehicleSummaryResult
-        
-        elif result == "none" or result == "None":
-
-             return {
+    elif result in {"vehiclesummary-all", "vehiclesummary-notall"}:
+        response_payload = RAG.get_vehicle_summary_by_name(
+            query=req.query,
+            vehicleid_collection=req.vehicleid_collection,
+            vehicle_name_key="VEHICLE_NO",
+            vehicle_id_key="VEHICLE_ID",
+            k=req.k,
+            session_id=session_id,
+            claims=claims,
+            persist_history=False,
+        )
+    else:
+        response_payload = {
             "query": req.query,
-            "session_id": req.session_id,
+            "session_id": session_id,
             "response": "Sorry, I couldn't assist you for this query. Please ask a different question.",
             "results": [],
         }
+
+    assistant_history_text = RAG._response_to_history_text(response_payload)
+    RAG.append_history_turn(
+        session_id=session_id,
+        user_text=req.query,
+        assistant_text=assistant_history_text,
+    )
+    return response_payload
+
+

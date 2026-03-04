@@ -1,6 +1,8 @@
 # rag_engine.py
 import os
 import re
+from datetime import datetime
+
 from typing import List, Dict, Any, Optional, Sequence
 import requests
 from langchain_core.documents import Document
@@ -24,14 +26,12 @@ from langchain_core.prompts import PromptTemplate
 from ApplicationConstants import AppConstants
 from Schemas import AskRequest, AskVehicleRequest
 from logger import logger
-
-
-
 class RAGEngine:
     _chat_histories:  Dict[str, InMemoryChatMessageHistory] = {}
     _CONTEXT_BUDGET_TOKENS = 12000
     _RESERVED_COMPLETION_TOKENS = 500
     _MAX_RESPONSE_TOKENS = 2000
+
     def __init__(
         self,
         collection_name: str = "t_defaultcollection",
@@ -48,7 +48,7 @@ class RAGEngine:
         self.embedding_function = HuggingFaceEmbeddings(model_name=embedding_model)
 
         os.makedirs(persist_directory, exist_ok=True)
-
+        
         self.vectorstore = Chroma(
             collection_name=collection_name,
             persist_directory=persist_directory,
@@ -83,6 +83,12 @@ class RAGEngine:
 
 
         # self.llm = ChatGoogleGenerativeAI(model=AppConstants.GEMINI_MODEL, temperature=0)
+        
+        
+
+
+
+
 
         if "OPENAI_API_KEY" not in os.environ:
                 os.environ["OPENAI_API_KEY"] = AppConstants.OPENAI_API_KEY
@@ -112,14 +118,13 @@ class RAGEngine:
     input_variables=["context", "question"],
 )
 
-
-
+     
 
         # RAG prompt
         self. prompt_template_RAG = PromptTemplate(
             template=(
                 "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
-                # "Conversation history:\n{chat_history}\n\n"
+                "Conversation history:\n{chat_history}\n\n"
                 "Context:\n{context}\n\n"
                 "Question: {question}\n\n"
                 "Return a clean, presentable response in this format:\n"
@@ -132,21 +137,31 @@ class RAGEngine:
             ),
             input_variables=["context", "question"],
         )
-        self.prompt_template_General = PromptTemplate(
-    template=(
-        "You are a helpful chatbot assistant.\n"
-        "Give only simple and direct answers.\n"
-        "Respond ONLY to questions related to vehicles (cars, bikes, trucks, EV, fuel, GPS, telematics, mileage, engine, etc.).\n"
-        "Do NOT prefix your answer with words like 'Answer:', 'Response:', etc.\n"
-        "If the question is NOT related to vehicles, reply only with:\n"
-        "\"This question is not related to vehicles. I cannot answer it.\"\n\n"
-        "Conversation history:\n{chat_history}\n\n"
+        self.prompt_template_VehicleDetail = PromptTemplate(
+            template=(
+                "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
+                # "Conversation history:\n{chat_history}\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {question}\n\n"
+                "This is a vehicle detail lookup task.\n"
+                "Return vehicle identity/details from context only.\n"
+                
+                "Focus on fields like VEHICLE_NO if present.\n"
+                "Hide VEHICLE_ID, MODEL or any other details if they appear in context.\n"
+                "Do not invent any value.\n"
+                "Do not include RESELLER_ID, CUSTOMER_ID, ORG_ID, or DEALER_ID in output.\n\n"
+                "Return a clean response in this format:\n"
+                "1) Matched Vehicles: list each matched vehicle on a new line as\n"
+                "   - VehicleNo: <value>, VehicleId: <value>, Model: <value>\n"
+                "2) Notes: short line for any missing fields as N/A.\n\n"
+                "If the context does not contain the answer, say: "
+                "\"I could not find this in the provided data.\""
+            ),
+            input_variables=["context", "question"],
+        )
+    
 
-        "Question: {question}\n"
-    ),
-    input_variables=["chat_history", "question"],
-)
-        
+
         self.prompt_template_query_status = PromptTemplate(
     template=(
         "Question: {question}\n"
@@ -155,10 +170,7 @@ class RAGEngine:
     ),
     input_variables=[ "question"],
 )
-  
 
-
-  
     @classmethod
     def _get_or_create_history(cls, session_id: str) -> InMemoryChatMessageHistory:
         if session_id not in cls._chat_histories:
@@ -205,6 +217,29 @@ class RAGEngine:
 
         return str(response).strip()
 
+    @staticmethod
+    def _normalize_query_label(label: str) -> str:
+        normalized = str(label or "").strip().lower()
+        allowed = {"generic", "vehiclesummary-all", "vehicledetail","vehiclesummary-notall", "none"}
+        if normalized in allowed:
+            return normalized
+        return "none"
+
+    @staticmethod
+    def _response_to_history_text(resp: Any) -> str:
+        if isinstance(resp, dict):
+            if "response" in resp and resp.get("response") is not None:
+                return RAGEngine._response_to_history_text(resp.get("response"))
+            if "answer" in resp and resp.get("answer") is not None:
+                return str(resp.get("answer"))
+        return str(resp or "").strip()
+
+    @classmethod
+    def append_history_turn(cls, session_id: str, user_text: str, assistant_text: str) -> None:
+        history = cls._get_or_create_history(session_id or "default")
+        history.add_message(HumanMessage(content=str(user_text or "")))
+        history.add_message(AIMessage(content=str(assistant_text or "")))
+
     def get_or_create_collection(self, collection_name: str) -> Chroma:
         return Chroma(
             collection_name=collection_name,
@@ -247,14 +282,65 @@ class RAGEngine:
 
     @staticmethod
     def _extract_vehicle_name_from_query(query: str) -> str:
-        pattern = r"[A-Za-z]{2}\d{1,2}[A-Za-z]{1,3}\d{1,4}"
-        match = re.search(pattern, query.replace(" ", ""))
-        if match:
-            return match.group(0)
+        vehicle_names = RAGEngine._extract_vehicle_names_from_text(query)
+        if vehicle_names:
+            return vehicle_names[0]
         return query.strip()
 
     @staticmethod
+    def _extract_vehicle_names_from_text(text: str) -> List[str]:
+        pattern = r"[A-Za-z]{2}\d{1,2}[A-Za-z]{1,3}\d{1,4}"
+        normalized = re.sub(r"\s+", "", str(text or "").upper())
+        matches = re.findall(pattern, normalized)
+        seen = set()
+        result: List[str] = []
+        for match in matches:
+            if match in seen:
+                continue
+            seen.add(match)
+            result.append(match)
+        return result
+
+    @staticmethod
+    def _is_referential_vehicle_query(query: str) -> bool:
+        normalized = str(query or "").lower()
+        markers = [
+            "this vehicle",
+            "that vehicle",
+            "same vehicle",
+            "previous vehicle",
+            "above vehicle",
+            "that one",
+            "this one",
+            "for vehicle",
+        ]
+        return any(marker in normalized for marker in markers)
+
+    def _resolve_vehicle_name_from_history(
+        self,
+        query: str,
+        history: InMemoryChatMessageHistory,
+    ) -> Optional[str]:
+        explicit_vehicle_names = self._extract_vehicle_names_from_text(query)
+        if explicit_vehicle_names:
+            return explicit_vehicle_names[0]
+        if not self._is_referential_vehicle_query(query):
+            return None
+
+        for msg in reversed(history.messages):
+            content = getattr(msg, "content", "")
+            vehicle_names = self._extract_vehicle_names_from_text(str(content))
+            if vehicle_names:
+                return vehicle_names[0]
+        return None
+
+    @staticmethod
     def _is_general_vehicle_query(query: str) -> bool:
+        if RAGEngine._extract_vehicle_names_from_text(query):
+            return False
+        if RAGEngine._is_referential_vehicle_query(query):
+            return False
+
         normalized = query.lower()
         general_markers = [
             "vehicle summary",
@@ -272,6 +358,48 @@ class RAGEngine:
         ]
         return any(marker in normalized for marker in general_markers)
 
+    
+    @staticmethod
+    def get_summary_month_from_query(query: str) -> Optional[str]:
+        normalized = str(query or "").lower()
+        month_aliases = {
+            "jan": "jan",
+            "january": "jan",
+            "feb": "feb",
+            "february": "feb",
+            "mar": "mar",
+            "march": "mar",
+            "apr": "apr",
+            "april": "apr",
+            "may": "may",
+            "jun": "jun",
+            "june": "jun",
+            "jul": "jul",
+            "july": "jul",
+            "aug": "aug",
+            "august": "aug",
+            "sep": "sep",
+            "sept": "sep",
+            "september": "sep",
+            "oct": "oct",
+            "october": "oct",
+            "nov": "nov",
+            "november": "nov",
+            "dec": "dec",
+            "december": "dec",
+        }
+
+        for token, month_value in month_aliases.items():
+            if re.search(rf"\b{re.escape(token)}\b", normalized):
+                return month_value
+        return None
+
+
+
+
+
+
+      
     @staticmethod
     def _is_active_vehicle_count_query(query: str) -> bool:
         normalized = query.lower()
@@ -334,6 +462,155 @@ class RAGEngine:
             if value not in (None, ""):
                 return value
         return None
+
+    def get_userrole(self, claims: Dict[str, Any]) -> Optional[str]:
+        role_id = self._get_claim_value(
+            claims or {},
+            ["roleId", "role_id", "ROLE_ID", "roleid"],
+        )
+        if role_id in (None, ""):
+            return self._get_claim_value(
+                claims or {},
+                ["userRole", "user_role", "USER_ROLE", "userrole"],
+            )
+
+        role_id = self._coerce_filter_value(role_id)
+        role_desc_keys = [
+            "ROLE_DESC",
+            "roleDesc",
+            "role_desc",
+            "USER_ROLE",
+            "userRole",
+            "role",
+        ]
+
+        role_id_variants = [role_id]
+        if isinstance(role_id, int):
+            role_id_variants.append(str(role_id))
+        elif isinstance(role_id, str) and role_id.isdigit():
+            role_id_variants.append(int(role_id))
+
+        where_keys = ["ID", "id", "ROLE_ID", "roleId", "roleid"]
+        for where_key in where_keys:
+            for role_id_value in role_id_variants:
+                try:
+                    records = self._get_records_by_metadata(
+                        collection_name="role_data_collection",
+                        where={where_key: role_id_value},
+                        limit=1,
+                    )
+                except Exception:
+                    continue
+
+                metadatas = records.get("metadatas") or []
+                if not metadatas:
+                    continue
+
+                metadata = metadatas[0] if isinstance(metadatas[0], dict) else {}
+                role_desc = self._pick_metadata_value(metadata, role_desc_keys)
+                if role_desc:
+                    return role_desc
+
+        return self._get_claim_value(
+            claims or {},
+            ["userRole", "user_role", "USER_ROLE", "userrole"],
+        )
+
+    # def _build_claims_where_new(self, claims: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+
+
+    #     key_mapping = {
+    #     "resellerId": "reseller_id",
+    #     "reseller_id": "reseller_id",
+    #     "RESELLER_ID": "reseller_id",
+    #     "resellerid": "reseller_id",
+
+    #     "customerId": "customer_id",
+    #     "customer_id": "customer_id",
+    #     "CUSTOMER_ID": "customer_id",
+    #     "customerid": "customer_id",
+
+    #     "orgId": "org_id",
+    #     "org_id": "org_id",
+    #     "ORG_ID": "org_id",
+    #     "orgid": "org_id",
+
+    #     "dealerId": "dealer_id",
+    #     "dealer_id": "dealer_id",
+    #     "DEALER_ID": "dealer_id",
+    #     "dealerid": "dealer_id",
+    # }
+
+    #     and_conditions: List[Dict[str, Any]] = []
+
+    #     for claim_key, metadata_key in key_mapping.items():
+    #         raw_value = claims.get(claim_key)
+    #         if raw_value in (None, ""):
+    #             continue
+
+    #         coerced_value = self._coerce_filter_value(raw_value)
+
+    #     # Avoid duplicate conditions
+    #         if not any(metadata_key in cond for cond in and_conditions):
+    #             and_conditions.append({metadata_key: coerced_value})
+
+    #     if not and_conditions:
+    #         return None
+
+    #     if len(and_conditions) == 1:
+    #         return and_conditions[0]
+
+    #     return {"$and": and_conditions}
+
+
+
+    def _build_claims_where_new(self, claims: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Build strict AND-based metadata filter using standardized UPPERCASE keys.
+        """
+
+        key_mapping = {
+        "resellerId": "RESELLER_ID",
+        "reseller_id": "RESELLER_ID",
+        "RESELLER_ID": "RESELLER_ID",
+
+        "customerId": "CUSTOMER_ID",
+        "customer_id": "CUSTOMER_ID",
+        "CUSTOMER_ID": "CUSTOMER_ID",
+
+        "orgId": "ORG_ID",
+        "org_id": "ORG_ID",
+        "ORG_ID": "ORG_ID",
+
+        "dealerId": "DEALER_ID",
+        "dealer_id": "DEALER_ID",
+        "DEALER_ID": "DEALER_ID",
+    }
+
+        normalized = {}
+
+        # Normalize claims to single uppercase metadata format
+        for claim_key, metadata_key in key_mapping.items():
+            value = claims.get(claim_key)
+            if value in (None, ""):
+                continue
+
+            coerced_value = self._coerce_filter_value(value)
+
+        # Only set once per metadata key
+            if metadata_key not in normalized:
+                 normalized[metadata_key] = coerced_value
+
+        if not normalized:
+            return None
+
+        and_conditions = [{k: v} for k, v in normalized.items()]
+
+        if len(and_conditions) == 1:
+            return and_conditions[0]
+
+        return {"$and": and_conditions}
+   
 
     def _build_claims_where(self, claims: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         claim_specs = [
@@ -586,12 +863,12 @@ class RAGEngine:
         self,
         query: str,
         vehicleid_collection: str,
-        summary_collection: str,
         vehicle_name_key: str = "VEHICLE_NO",
         vehicle_id_key: str = "VEHICLE_ID",
         k: int = 5,
         session_id: str = "default",
         claims: Optional[Dict[str, Any]] = None,
+        persist_history: bool = True,
     ) -> Dict[str, Any]:
         
 
@@ -599,8 +876,21 @@ class RAGEngine:
         session_id = session_id or "default"
         claims = claims or {}
         history = self._get_or_create_history(session_id)
+        
+        resolved_vehicle_name = self._resolve_vehicle_name_from_history(query, history)
         is_general_query = self._is_general_vehicle_query(query)
-        vehicle_name = self._extract_vehicle_name_from_query(query)
+        summary_month = self.get_summary_month_from_query(query)
+
+
+
+    #    vehiclesummary_feb_collection_v3
+        if summary_month is None:
+             summary_month = datetime.now().strftime("%b").lower()
+        summary_collection = f"vehiclesummary_{summary_month}_collection_v3"
+    
+        vehicle_name = resolved_vehicle_name or self._extract_vehicle_name_from_query(query)
+        if resolved_vehicle_name:
+            is_general_query = False
         vehicle_id: Optional[str] = None
 
         if not is_general_query:
@@ -659,8 +949,9 @@ class RAGEngine:
                 vehicle_id_key=vehicle_id_key,
             )
             answer_text = f"There are {active_vehicle_count} active vehicles."
-            history.add_message(HumanMessage(content=query))
-            history.add_message(AIMessage(content=answer_text))
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
             return {
                 "query": query,
                 "vehicle_name": "ALL_VEHICLES",
@@ -698,8 +989,9 @@ class RAGEngine:
                 )
         elif vehicle_id is None:
             answer_text = "I could not find this in the provided data."
-            history.add_message(HumanMessage(content=query))
-            history.add_message(AIMessage(content=answer_text))
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
             return {
                 "query": query,
                 "vehicle_name": vehicle_name,
@@ -746,8 +1038,9 @@ class RAGEngine:
 
         if not results:
             answer_text = "I could not find this in the provided data."
-            history.add_message(HumanMessage(content=query))
-            history.add_message(AIMessage(content=answer_text))
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
             return {
                 "query": query,
                 "vehicle_name": vehicle_name,
@@ -782,8 +1075,9 @@ class RAGEngine:
         )
         if not context:
             answer_text = "I could not find this in the provided data."
-            history.add_message(HumanMessage(content=query))
-            history.add_message(AIMessage(content=answer_text))
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
             return {
                 "query": query,
                 "vehicle_name": vehicle_name,
@@ -803,8 +1097,9 @@ class RAGEngine:
         answer = self.llm.invoke(prompt)
         answer_text = self._llm_response_to_text(answer)
         self._print_token_usage(prompt, answer_text, "vehiclesummary")
-        history.add_message(HumanMessage(content=query))
-        history.add_message(AIMessage(content=answer_text))
+        if persist_history:
+            history.add_message(HumanMessage(content=query))
+            history.add_message(AIMessage(content=answer_text))
 
         return {
             "query": query,
@@ -906,51 +1201,198 @@ class RAGEngine:
         self.vectorstore.persist()
 
 
-    def answer_vehicle(self, query: str):
-     try:
-        session_id = "default"
-        history = self._get_or_create_history(session_id)
+    def answer_vehicle(
+        self,
+        query: str,
+        session_id: str = "default",
+        persist_history: bool = True,
+    ) -> Dict[str, Any]:
+        try:
+            session_id = session_id or "default"
+            history = self._get_or_create_history(session_id)
 
-        promptGeneral = self.prompt_template_General.format(
-            chat_history=self._format_recent_history(history),
+            prompt_general = self.prompt_template_General.format(
+                chat_history=self._format_recent_history(history),
+                question=query,
+            )
+
+            logger.info("prompt_general -----> %s", prompt_general)
+
+            response = self.llm.invoke(prompt_general)
+            answer_text = self._llm_response_to_text(response)
+            self._print_token_usage(prompt_general, answer_text, "ask_Vehicles")
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
+
+            return {"answer": answer_text, "session_id": session_id}
+        except Exception as e:
+            logger.error(f"Error in answer_vehicle: {e}")
+            return {
+                "answer": "An error occurred while processing your request.",
+                "session_id": session_id or "default",
+            }
+        
+
+    def get_vehicle_detail(
+        self,
+        query: str,
+        claims: Optional[Dict[str, Any]] = None,
+        session_id: str = "default",
+        persist_history: bool = True,
+        vehicle_detail_collection: str = "vehicle_data_collection5",
+        k: int = 20,
+    ) -> Dict[str, Any]:
+        session_id = session_id or "default"
+        history = self._get_or_create_history(session_id)
+        claims = claims or {}
+        claims_where = self._build_claims_where_new(claims)
+
+        logger.info("get_vehicle_detail claims: %s", claims)
+        logger.info("get_vehicle_detail claims_where: %s", claims_where)
+
+        detail_db = self.get_or_create_collection(vehicle_detail_collection)
+        explicit_vehicle_names = self._extract_vehicle_names_from_text(query)
+        results: List[Dict[str, Any]] = []
+
+        if explicit_vehicle_names:
+            vehicle_no = explicit_vehicle_names[0]
+            where_filter: Dict[str, Any] = {"VEHICLE_NO": vehicle_no}
+            if claims_where:
+                where_filter = {"$and": [{"VEHICLE_NO": vehicle_no}, claims_where]}
+            records = detail_db.get(where=where_filter)
+            ids = records.get("ids") or []
+            docs = records.get("documents") or []
+            metas = records.get("metadatas") or []
+            result_count = min(len(ids), len(docs), len(metas))
+            for i in range(result_count):
+                results.append(
+                    {
+                        "id": ids[i],
+                        "document": docs[i],
+                        "metadata": metas[i] if isinstance(metas[i], dict) else {},
+                    }
+                )
+        else:
+            # If query has no explicit vehicle number, return records by claim scope.
+            if claims_where:
+                records = detail_db.get(where=claims_where)
+                ids = records.get("ids") or []
+                docs = records.get("documents") or []
+                metas = records.get("metadatas") or []
+                result_count = min(len(ids), len(docs), len(metas))
+                for i in range(result_count):
+                    results.append(
+                        {
+                            "id": ids[i],
+                            "document": docs[i],
+                            "metadata": metas[i] if isinstance(metas[i], dict) else {},
+                        }
+                    )
+            else:
+                similar_docs = detail_db.similarity_search(query=query, k=k)
+                for doc in similar_docs:
+                    results.append(
+                        {
+                            "id": None,
+                            "document": getattr(doc, "page_content", ""),
+                            "metadata": getattr(doc, "metadata", {}) or {},
+                        }
+                    )
+
+        context_docs = self._build_vehicle_grouped_context_docs(results)
+        context = self._build_bounded_context(
+            context_docs,
+            token_budget=self._CONTEXT_BUDGET_TOKENS,
+        )
+        if not context:
+            answer_text = "I could not find this in the provided data."
+            if persist_history:
+                history.add_message(HumanMessage(content=query))
+                history.add_message(AIMessage(content=answer_text))
+            return {
+                "query": query,
+                "session_id": session_id,
+                "response": answer_text,
+                "results": [],
+            }
+
+        prompt = self.prompt_template_VehicleDetail.format(
+            # chat_history=self._format_recent_history(history),
+            context=context,
             question=query
         )
 
-        logger.info(f"promptGeneral -----> {promptGeneral}")
+        print(prompt)
 
-        response = self.llm.invoke(promptGeneral)
-        answer_text = self._llm_response_to_text(response)
-        self._print_token_usage(promptGeneral, answer_text, "ask_Vehicles")
-        history.add_message(HumanMessage(content=query))
-        history.add_message(AIMessage(content=answer_text))
+        answer = self.llm.invoke(prompt)
+        answer_text = self._llm_response_to_text(answer)
+        self._print_token_usage(prompt, answer_text, "vehiclesummary")
+        if persist_history:
+            history.add_message(HumanMessage(content=query))
+            history.add_message(AIMessage(content=answer_text))
 
-        return {"answer": answer_text, "session_id": session_id}
-     except Exception as e:
-        logger.error(f"Error in answer_vehicle: {e}")
-        return {"answer": "An error occurred while processing your request."}
-     
+        return {
+            "query": query,
+            "session_id": session_id,
+            "response": answer_text,
+            "results": results,
+        }
 
-    def query_status_check(self, query: str):
-     try:
-        session_id = "default"
-        history = self._get_or_create_history(session_id)
 
-        promptGeneral = self.prompt_template_query_status.format(
-            question=query
-        )
 
-        logger.info(f"promptGeneral -----> {promptGeneral}")
+    def query_status_check(
+        self,
+        query: str,
+        session_id: str,
+        use_history_for_classification: bool = True,
+    ) -> str:
+        try:
+            session_id = session_id or "default"
+            history = self._get_or_create_history(session_id)
+            history_text = (
+                self._format_recent_history(history)
+                if use_history_for_classification
+                else "No previous conversation."
+            )
 
-        response = self.llm.invoke(promptGeneral)
-        answer_text = self._llm_response_to_text(response)
-        self._print_token_usage(promptGeneral, answer_text, "query_status_check")
-        history.add_message(HumanMessage(content=query))
-        history.add_message(AIMessage(content=answer_text))
+            classifier_prompt = (
+                "You are a strict query classifier.\n"
+                "Classify the CURRENT QUERY into exactly one label from this list:\n"
+                "generic, vehicledetail, vehiclesummary-all, vehiclesummary-notall, none\n\n"
+                "Decision rules (apply in this order):\n"
+                "1) If the user asks for summary/report/overview/status/health of vehicles:\n"
+                "   - Use vehiclesummary-all for all vehicles/fleet/every vehicle.\n"
+                "   - Use vehiclesummary-notall for one/some specific vehicles.\n"
+                "2) If the user asks for vehicle identity/details (vehicle number, vehicle id, model,\n"
+                "   registration, list/find/search/show vehicles) and does NOT ask for summary/report/overview,\n"
+                "   return vehicledetail.\n"
+                "3) If the user asks a general vehicle-domain question not requesting vehicle lookup/summary,\n"
+                "   return generic.\n"
+                "4) If unrelated to vehicle domain, return none.\n\n"
+                "Important:\n"
+                "- Prefer vehicledetail when query is about identifying or listing vehicles.\n"
+                "- Use chat history only for disambiguation; prioritize CURRENT QUERY.\n"
+                "- Return only the label text, no explanation or punctuation.\n\n"
+                f"Chat history:\n{history_text}\n\n"
+                f"Current query:\n{query}\n"
+            )
 
-        return answer_text
-     except Exception as e:
-        logger.error(f"Error in query_status_check: {e}")
-        return {"answer": "An error occurred while processing your request."}
+            response = self.llm.invoke(classifier_prompt)
+          
+            answer_text = self._llm_response_to_text(response)
+            label_match = re.search(
+                r"\b(generic|vehicledetail|vehiclesummary-all|vehiclesummary-notall|none)\b",
+                answer_text.strip().lower(),
+            )
+            if label_match:
+                answer_text = label_match.group(1)
+            self._print_token_usage(classifier_prompt, answer_text, "query_status_check")
+            return self._normalize_query_label(answer_text)
+        except Exception as e:
+            logger.error(f"Error in query_status_check: {e}")
+            return "none"
 
-   
+
+
       
