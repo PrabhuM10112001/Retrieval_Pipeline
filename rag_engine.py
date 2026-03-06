@@ -160,6 +160,25 @@ class RAGEngine:
             input_variables=["context", "question"],
         )
     
+        
+
+        self.prompt_template_General = PromptTemplate(
+    template=(
+        "You are a helpful chatbot assistant.\n"
+        "Give only simple and direct answers.\n"
+        "Respond ONLY to questions related to vehicles (cars, bikes, trucks, EV, fuel, GPS, telematics, mileage, engine, etc.).\n"
+        "Do NOT prefix your answer with words like 'Answer:', 'Response:', etc.\n"
+        "If the question is NOT related to vehicles, reply only with:\n"
+        "\"This question is not related to vehicles. I cannot answer it.\"\n\n"
+        "Conversation history:\n{chat_history}\n\n"
+
+        "Question: {question}\n"
+    ),
+    input_variables=["chat_history", "question"],
+)
+
+
+
 
 
         self.prompt_template_query_status = PromptTemplate(
@@ -981,10 +1000,8 @@ class RAGEngine:
                 )
                 results.append(
                     {
-                        "id": ids[i],
                         "document": docs[i],
-                        "vehicleNo": vehicle_no,
-                        "metadata": metas[i],
+                 
                     }
                 )
         elif vehicle_id is None:
@@ -1029,10 +1046,7 @@ class RAGEngine:
             for i in range(result_count):
                 results.append(
                     {
-                        "id": ids[i],
                         "document": docs[i],
-                        "vehicleNo": vehicle_name,
-                        "metadata": metas[i],
                     }
                 )
 
@@ -1069,11 +1083,11 @@ class RAGEngine:
         #     }
 
         context_docs = self._build_vehicle_grouped_context_docs(results)
-        context = self._build_bounded_context(
-            context_docs,
-            token_budget=self._CONTEXT_BUDGET_TOKENS,
-        )
-        if not context:
+        # context = self._build_bounded_context(
+        #     context_docs,
+        #     token_budget=self._CONTEXT_BUDGET_TOKENS,
+        # )
+        if not context_docs:
             answer_text = "I could not find this in the provided data."
             if persist_history:
                 history.add_message(HumanMessage(content=query))
@@ -1090,7 +1104,7 @@ class RAGEngine:
 
         prompt = self.prompt_template_All_VehicleSummary.format(
             chat_history=self._format_recent_history(history),
-            context=context,
+            context=context_docs,
             question=query
         )
 

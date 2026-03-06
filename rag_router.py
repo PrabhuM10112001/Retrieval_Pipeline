@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException, Depends
 from rag_engine import RAGEngine
 from Schemas import AskVehicleRequest, AskRequest, VehicleSummaryByNameRequest
 from JwtValidation.JwtTokenValidate import jwt_filter
+from vehicle_summary_all_batched import VehicleSummaryAllBatchProcessor
+
 import re
 
 router = APIRouter(
@@ -11,7 +13,7 @@ router = APIRouter(
 )
 
 RAG = RAGEngine()
-
+vehiclesummaryAll = VehicleSummaryAllBatchProcessor()
 # def is_vehicle_related_query(query: str) -> bool:
 #     if not query or not query.strip():
 #         return False
@@ -90,7 +92,7 @@ def chatbot_rag_method(
     if result == "generic":
         vehicle_result = RAG.answer_vehicle(
             query=req.query,
-            session_id=session_id,
+            session_id="generic",
             persist_history=False,
         )
         response_payload = {
@@ -104,28 +106,46 @@ def chatbot_rag_method(
         response_payload = RAG.get_vehicle_detail(
             query=req.query,
             vehicle_detail_collection=req.vehicleid_collection,
-            session_id=session_id,
+            session_id="vehicledetail",
             claims=claims,
             persist_history=False,
         )
          
 
-
-    elif result in {"vehiclesummary-all", "vehiclesummary-notall"}:
+    elif result in {"vehiclesummary-notall"}:
         response_payload = RAG.get_vehicle_summary_by_name(
             query=req.query,
             vehicleid_collection=req.vehicleid_collection,
             vehicle_name_key="VEHICLE_NO",
             vehicle_id_key="VEHICLE_ID",
             k=req.k,
-            session_id=session_id,
+            session_id="vehiclesummary-all",
             claims=claims,
             persist_history=False,
         )
-    else:
+
+    elif result in {"vehiclesummary-all"}:
+
+        batch_result = vehiclesummaryAll.process_all_vehicle_summary(
+            query=req.query,
+            vehicleid_collection=req.vehicleid_collection,
+            # vehicle_name_key="VEHICLE_NO",
+            # vehicle_id_key="VEHICLE_ID",
+            # k=req.k,
+            session_id=session_id,
+            claims=claims,
+        )
         response_payload = {
             "query": req.query,
             "session_id": session_id,
+            "response": batch_result["final_summary"],
+            "results": batch_result["final_summary"],
+        }
+
+
+    else:
+        response_payload = {
+            "query": req.query,
             "response": "Sorry, I couldn't assist you for this query. Please ask a different question.",
             "results": [],
         }
