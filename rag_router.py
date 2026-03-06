@@ -3,6 +3,7 @@ from rag_engine import RAGEngine
 from Schemas import AskVehicleRequest, AskRequest, VehicleSummaryByNameRequest
 from JwtValidation.JwtTokenValidate import jwt_filter
 from vehicle_summary_all_batched import VehicleSummaryAllBatchProcessor
+from vehicle_detail_all_batched import VehicleDetailAllBatchProcessor
 
 import re
 
@@ -14,6 +15,7 @@ router = APIRouter(
 
 RAG = RAGEngine()
 vehiclesummaryAll = VehicleSummaryAllBatchProcessor()
+vehicleDetailAll = VehicleDetailAllBatchProcessor()
 # def is_vehicle_related_query(query: str) -> bool:
 #     if not query or not query.strip():
 #         return False
@@ -102,14 +104,18 @@ def chatbot_rag_method(
             "results": [],
         }
     elif result == "vehicledetail" :
-
-        response_payload = RAG.get_vehicle_detail(
+        detail_batch_result = vehicleDetailAll.process_all_vehicle_detail(
             query=req.query,
             vehicle_detail_collection=req.vehicleid_collection,
-            session_id="vehicledetail",
+            session_id=session_id,
             claims=claims,
-            persist_history=False,
         )
+        response_payload = {
+            "query": req.query,
+            "session_id": session_id,
+            "response": detail_batch_result["final_response"],
+            "results": detail_batch_result["results"],
+        }
          
 
     elif result in {"vehiclesummary-notall"}:
@@ -157,5 +163,4 @@ def chatbot_rag_method(
         assistant_text=assistant_history_text,
     )
     return response_payload
-
 

@@ -113,7 +113,7 @@ class VehicleSummaryAllBatchProcessor:
         base_response["total_batches"] = len(batches)
 
         if not records:
-            base_response["final_summary"] = "I could not find this in the provided data."
+            base_response["final_summary"] = "No relevant records were found in the available data."
             return base_response
 
         partial_summaries: List[Dict[str, Any]] = []
@@ -159,7 +159,7 @@ class VehicleSummaryAllBatchProcessor:
         elif errors:
             final_summary = "Unable to summarize due to processing errors."
         else:
-            final_summary = "I could not find this in the provided data."
+            final_summary = "No relevant records were found in the available data."
 
         base_response["partial_summaries"] = partial_summaries
         base_response["final_summary"] = final_summary
@@ -381,7 +381,7 @@ class VehicleSummaryAllBatchProcessor:
             "2) Summary points: <key values in bullets>\n"
         )
         response = self._invoke_llm(prompt, stage_name=f"batch_{batch_index}")
-        time.sleep(2)  # throttle requests
+        time.sleep(5)  # throttle requests
 
         return self._response_to_text(response)
 

@@ -132,7 +132,7 @@ class RAGEngine:
                 "2) Key points: 2-5 bullet points.\n"
                 "3) Data used: short line mentioning important values from context.\n\n"
                 "If the context does not contain the answer, say: "
-                "\"I could not find this in the provided data.\""
+                "\"No relevant records were found in the available data.\""
                 # chat_history
             ),
             input_variables=["context", "question"],
@@ -155,7 +155,7 @@ class RAGEngine:
                 "   - VehicleNo: <value>, VehicleId: <value>, Model: <value>\n"
                 "2) Notes: short line for any missing fields as N/A.\n\n"
                 "If the context does not contain the answer, say: "
-                "\"I could not find this in the provided data.\""
+                "\"No relevant records were found in the available data.\""
             ),
             input_variables=["context", "question"],
         )
@@ -615,7 +615,9 @@ class RAGEngine:
                 continue
 
             coerced_value = self._coerce_filter_value(value)
-
+            if coerced_value == 0:
+                # 0 means "not scoped" for these claims; skip filter generation.
+                continue
         # Only set once per metadata key
             if metadata_key not in normalized:
                  normalized[metadata_key] = coerced_value
@@ -645,6 +647,9 @@ class RAGEngine:
             if raw_value in (None, ""):
                 continue
             coerced_value = self._coerce_filter_value(raw_value)
+            if coerced_value == 0:
+                # 0 means "not scoped" for these claims; skip filter generation.
+                continue
             value_variants = [coerced_value]
             if isinstance(coerced_value, int):
                 value_variants.append(str(coerced_value))
@@ -795,7 +800,7 @@ class RAGEngine:
         vehicle_id_key: str,
     ) -> str:
         if not results:
-            return "I could not find this in the provided data."
+            return "No relevant records were found in the available data."
 
         blocks: List[str] = []
         for index, item in enumerate(results, start=1):
@@ -1005,7 +1010,7 @@ class RAGEngine:
                     }
                 )
         elif vehicle_id is None:
-            answer_text = "I could not find this in the provided data."
+            answer_text = "No relevant records were found in the available data."
             if persist_history:
                 history.add_message(HumanMessage(content=query))
                 history.add_message(AIMessage(content=answer_text))
@@ -1051,7 +1056,7 @@ class RAGEngine:
                 )
 
         if not results:
-            answer_text = "I could not find this in the provided data."
+            answer_text = "No relevant records were found in the available data."
             if persist_history:
                 history.add_message(HumanMessage(content=query))
                 history.add_message(AIMessage(content=answer_text))
@@ -1088,7 +1093,7 @@ class RAGEngine:
         #     token_budget=self._CONTEXT_BUDGET_TOKENS,
         # )
         if not context_docs:
-            answer_text = "I could not find this in the provided data."
+            answer_text = "No relevant records were found in the available data."
             if persist_history:
                 history.add_message(HumanMessage(content=query))
                 history.add_message(AIMessage(content=answer_text))
@@ -1320,7 +1325,7 @@ class RAGEngine:
             token_budget=self._CONTEXT_BUDGET_TOKENS,
         )
         if not context:
-            answer_text = "I could not find this in the provided data."
+            answer_text = "No relevant records were found in the available data."
             if persist_history:
                 history.add_message(HumanMessage(content=query))
                 history.add_message(AIMessage(content=answer_text))
