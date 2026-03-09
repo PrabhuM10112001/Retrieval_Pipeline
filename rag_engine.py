@@ -118,6 +118,27 @@ class RAGEngine:
     input_variables=["context", "question"],
 )
 
+
+
+        self.prompt_template_Vehiclename = PromptTemplate(
+    template=(
+        "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Vehicle in Context and Vehicle in User Query are same.\n"
+        "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
+        "Output exactly one section per unique vehicle number. Do not repeat the same vehicle section.\n"
+        "Return a clean, presentable response in this format:\n"
+        "For each vehicle in the context:\n\n"
+        "**Vehicle: [Vehicle in User Query] **\n"
+        "Never reveal RESELLER_ID, CUSTOMER_ID, ORG_ID, or DEALER_ID.\n"
+        "If these fields appear in context, omit them completely from output.\n"
+        # "1) Summary: one short paragraph.\n"
+        # "2) Summary points: List all the parameters values.\n"
+    ),
+    input_variables=["context", "question"],
+)
+
      
 
         # RAG prompt
@@ -902,6 +923,8 @@ class RAGEngine:
         history = self._get_or_create_history(session_id)
         
         resolved_vehicle_name = self._resolve_vehicle_name_from_history(query, history)
+        explicit_vehicle_names = self._extract_vehicle_names_from_text(query)
+        has_explicit_vehicle_name = bool(explicit_vehicle_names)
         is_general_query = self._is_general_vehicle_query(query)
         summary_month = self.get_summary_month_from_query(query)
 
@@ -925,7 +948,7 @@ class RAGEngine:
                 vehicle_id_key=vehicle_id_key,
             )
 
-        if vehicle_id is None and not is_general_query:
+        if vehicle_id is None and not is_general_query and not has_explicit_vehicle_name:
             vehicleid_db = self.get_or_create_collection(vehicleid_collection)
             similar_vehicle_docs = vehicleid_db.similarity_search(query=query, k=1)
             if similar_vehicle_docs:
@@ -1107,7 +1130,7 @@ class RAGEngine:
                 "is_general_query": is_general_query,
             }
 
-        prompt = self.prompt_template_All_VehicleSummary.format(
+        prompt = self.prompt_template_Vehiclename.format(
             chat_history=self._format_recent_history(history),
             context=context_docs,
             question=query
@@ -1383,12 +1406,16 @@ class RAGEngine:
                 "1) If the user asks for summary/report/overview/status/health of vehicles:\n"
                 "   - Use vehiclesummary-all for all vehicles/fleet/every vehicle.\n"
                 "   - Use vehiclesummary-notall for one/some specific vehicles.\n"
-                "2) If the user asks for vehicle identity/details (vehicle number, vehicle id, model,\n"
+                "2) If the user asks for total count of the vehicles/active vehicles/overall vehicles:\n"
+                "   return vehicledetail.\n"
+                "3) If the user asks for vehicle identity/details (vehicle number, vehicle id, model,\n"
                 "   registration, list/find/search/show vehicles) and does NOT ask for summary/report/overview,\n"
                 "   return vehicledetail.\n"
-                "3) If the user asks a general vehicle-domain question not requesting vehicle lookup/summary,\n"
+
+                "4) If the user asks a general vehicle-domain questions (eg: telematics, canodometer , etc) not requesting vehicle lookup/summary,\n"
                 "   return generic.\n"
-                "4) If unrelated to vehicle domain, return none.\n\n"
+
+                "5) If unrelated to vehicle domain, return none.\n\n"
                 "Important:\n"
                 "- Prefer vehicledetail when query is about identifying or listing vehicles.\n"
                 "- Use chat history only for disambiguation; prioritize CURRENT QUERY.\n"

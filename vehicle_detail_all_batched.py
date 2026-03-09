@@ -51,11 +51,11 @@ class VehicleDetailAllBatchProcessor:
         session_id = session_id or "default"
         query = str(query or "").strip()
 
-        classification_label = self._classify_query(query=query, session_id=session_id)
+        # classification_label = self._classify_query(query=query, session_id=session_id)
         base_response: Dict[str, Any] = {
             "query": query,
             "session_id": session_id,
-            "classification_label": classification_label,
+            # "classification_label": classification_label,
             "processed": False,
             "skip_reason": None,
             "vehicle_detail_collection": vehicle_detail_collection,
@@ -69,9 +69,9 @@ class VehicleDetailAllBatchProcessor:
             "results": [],
         }
 
-        if classification_label != "vehicledetail":
-            base_response["skip_reason"] = "classification_not_vehicledetail"
-            return base_response
+        # if classification_label != "vehicledetail":
+        #     base_response["skip_reason"] = "classification_not_vehicledetail"
+        #     return base_response
 
         records = self._fetch_all_records(
             vehicle_detail_collection=vehicle_detail_collection,
@@ -99,12 +99,25 @@ class VehicleDetailAllBatchProcessor:
         partial_details: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
         all_results: List[Dict[str, Any]] = []
+        total_batches = len(batches)
 
         for batch_index, batch_items in enumerate(batches, start=1):
             batch_results = [payload for _, payload in batch_items]
             all_results.extend(batch_results)
 
-            detail_text = self._format_batch_rows(batch_items)
+            try:
+                batch_context = self._build_detail_batch_context(batch_items)
+                detail_text = self._generate_detail_batch_llm(
+                    batch_context=batch_context,
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    query=query,
+                )
+            except Exception as exc:
+                logger.error("Batch detail generation failed for batch %s: %s", batch_index, exc)
+                errors.append({"batch_index": batch_index, "error": str(exc)})
+                detail_text = self._format_batch_rows(batch_items)
+
             partial_details.append(
                 {
                     "batch_index": batch_index,
@@ -114,8 +127,18 @@ class VehicleDetailAllBatchProcessor:
                 }
             )
 
-        if all_results:
-            final_response = self._format_consolidated_rows(all_results)
+        if len(partial_details) == 1 and total_batches == 1:
+            final_response = str(partial_details[0].get("detail") or "").strip()
+        elif partial_details:
+            try:
+                final_response = self._synthesize_detail_partials_llm(
+                    partial_details=partial_details,
+                    query=query,
+                )
+            except Exception as exc:
+                logger.error("Final detail synthesis failed: %s", exc)
+                errors.append({"stage": "final_synthesis", "error": str(exc)})
+                final_response = self._format_consolidated_rows(all_results)
         elif errors:
             final_response = "Unable to process vehicle details due to errors."
         else:
@@ -317,6 +340,122 @@ class VehicleDetailAllBatchProcessor:
                 f"- VehicleNo: {vehicle_no}, VehicleId: {vehicle_id}, Model: {model}"
             )
         return "\n".join(rows)
+
+    @staticmethod
+    def _truncate_text(value: str, max_chars: int = 220) -> str:
+        text = str(value or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return f"{text[: max_chars - 3]}..."
+
+    def _build_detail_batch_context(
+        self,
+        batch_items: List[Tuple[str, Dict[str, Any]]],
+    ) -> str:
+        parts: List[str] = []
+        for _, payload in batch_items:
+            vehicle_no, vehicle_id, model = self._resolve_vehicle_row(payload)
+            documents = payload.get("documents") or []
+            snippets: List[str] = []
+            for idx, doc in enumerate(documents[:2], start=1):
+                snippet = self._truncate_text(str(doc), max_chars=220)
+                if snippet:
+                    snippets.append(f"{idx}) {snippet}")
+            supporting_text = "\n".join(snippets) if snippets else "N/A"
+
+            parts.append(
+                "\n".join(
+                    [
+                        f"VehicleNo: {vehicle_no}",
+                        f"VehicleId: {vehicle_id}",
+                        f"Model: {model}",
+                        "Supporting snippets:",
+                        supporting_text,
+                    ]
+                )
+            )
+        return "\n\n---\n\n".join(parts)
+
+    @staticmethod
+    def _extract_strict_row_lines(text: str) -> List[str]:
+        rows: List[str] = []
+        seen: set = set()
+        pattern = re.compile(
+            r"^\s*-\s*VehicleNo:\s*(.+?),\s*VehicleId:\s*(.+?),\s*Model:\s*(.+?)\s*$",
+            re.IGNORECASE,
+        )
+        for line in str(text or "").splitlines():
+            match = pattern.match(line.strip())
+            if not match:
+                continue
+            normalized_line = (
+                f"- VehicleNo: {match.group(1).strip()}, "
+                f"VehicleId: {match.group(2).strip()}, "
+                f"Model: {match.group(3).strip()}"
+            )
+            signature = normalized_line.upper()
+            if signature in seen:
+                continue
+            seen.add(signature)
+            rows.append(normalized_line)
+        return rows
+
+    def _generate_detail_batch_llm(
+        self,
+        batch_context: str,
+        batch_index: int,
+        total_batches: int,
+        query: str,
+    ) -> str:
+        prompt = (
+            "You are a strict vehicle detail formatter.\n"
+            "Use ONLY the provided context.\n"
+            "Return vehicle detail rows in this exact format only:\n"
+            "- VehicleNo: <value>, VehicleId: <value>, Model: <value>\n\n"
+            "Rules:\n"
+            "- One row per unique vehicle.\n"
+            "- Deduplicate duplicates in this batch.\n"
+            "- If VehicleId/Model is missing, use N/A.\n"
+            "- Do not add headings, notes, or extra text.\n\n"
+            f"Batch index: {batch_index}\n"
+            f"Total batches: {total_batches}\n"
+            f"Original user query: {query}\n\n"
+            f"Context:\n{batch_context}\n"
+        )
+        response = self._invoke_llm(prompt, stage_name=f"detail_batch_{batch_index}")
+        response_text = self._response_to_text(response)
+        rows = self._extract_strict_row_lines(response_text)
+        return "\n".join(rows) if rows else response_text
+
+    def _synthesize_detail_partials_llm(
+        self,
+        partial_details: List[Dict[str, Any]],
+        query: str,
+    ) -> str:
+        partial_text_blocks: List[str] = []
+        for item in partial_details:
+            batch_index = item.get("batch_index")
+            detail_text = str(item.get("detail") or "").strip()
+            if detail_text:
+                partial_text_blocks.append(f"Batch {batch_index}:\n{detail_text}")
+
+        prompt = (
+            "You are a strict vehicle detail consolidator.\n"
+            "Use only the provided batch outputs.\n"
+            "Return rows in this exact format only:\n"
+            "- VehicleNo: <value>, VehicleId: <value>, Model: <value>\n\n"
+            "Rules:\n"
+            "- One row per unique VehicleNo.\n"
+            "- Prefer non-N/A values when duplicates have different values.\n"
+            "- Keep output concise with rows only; no headings or notes.\n\n"
+            f"Original user query: {query}\n\n"
+            "Batch outputs:\n"
+            f"{chr(10).join(partial_text_blocks)}\n"
+        )
+        response = self._invoke_llm(prompt, stage_name="detail_final_synthesis")
+        response_text = self._response_to_text(response)
+        rows = self._extract_strict_row_lines(response_text)
+        return "\n".join(rows) if rows else response_text
 
     def _format_consolidated_rows(self, all_results: List[Dict[str, Any]]) -> str:
         dedup: Dict[str, Dict[str, Any]] = {}
