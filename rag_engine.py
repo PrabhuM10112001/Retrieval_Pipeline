@@ -105,8 +105,10 @@ class RAGEngine:
         "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n\n"
+        
         "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
         "Output exactly one section per unique vehicle number. Do not repeat the same vehicle section.\n"
+                "Include emojis in your response to make it more engaging.\n"
         "Return a clean, presentable response in this format:\n"
         "For each vehicle in the context:\n\n"
         "**Vehicle: [Vehicle NO] **\n"
@@ -125,6 +127,8 @@ class RAGEngine:
         "You are a helpful chatbot assistant. Use ONLY the provided context to answer.\n\n"
         "Context:\n{context}\n\n"
         "Question: {question}\n\n"
+        "Include emojis in your response to make it more engaging. For dates/times responds with  emojis\n"
+
         "Vehicle in Context and Vehicle in User Query are same.\n"
         "Extract and list vehicle summary details from the context, organized vehicle-wise.\n\n"
         "Output exactly one section per unique vehicle number. Do not repeat the same vehicle section.\n"
@@ -166,7 +170,8 @@ class RAGEngine:
                 "Question: {question}\n\n"
                 "This is a vehicle detail lookup task.\n"
                 "Return vehicle identity/details from context only.\n"
-                
+                "Include emojis in your response to make it more engaging.\n"
+
                 "Focus on fields like VEHICLE_NO if present.\n"
                 "Hide VEHICLE_ID, MODEL or any other details if they appear in context.\n"
                 "Do not invent any value.\n"
@@ -187,6 +192,7 @@ class RAGEngine:
     template=(
         "You are a helpful chatbot assistant.\n"
         "Give only simple and direct answers.\n"
+        "Include emojis in your response to make it more engaging.\n"
         "Respond ONLY to questions related to vehicles (cars, bikes, trucks, EV, fuel, GPS, telematics, mileage, engine, etc.).\n"
         "Do NOT prefix your answer with words like 'Answer:', 'Response:', etc.\n"
         "If the question is NOT related to vehicles, reply only with:\n"
